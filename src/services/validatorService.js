@@ -1,7 +1,8 @@
 /**
  * src/services/validatorService.js
- * Menangani antrean file, proses validasi Excel (SheetJS), dan pengecekan Rules (R5-R20).
- * Update: Ditambahkan pemisahan logika validasi untuk fitur Re-Validate Mode Edit.
+ * Menangani antrean file, proses validasi, dan pengecekan Rules (R5-R20).
+ * Update Phase 1: Integrasi Web Worker untuk proses masif agar UI tidak freeze.
+ * Memory Optimization: Tidak lagi menyimpan objek XLSX.Workbook utuh di RAM.
  */
 
 import { appState, recalculateStats, clearValidatorState } from '../state/store.js';
@@ -74,10 +75,8 @@ export function updateRowStatusUI(rowId, item) {
     const toggleTitle = item.status === 'PASS' ? 'Force Fail' : 'Force Pass';
     const toggleColor = item.status === 'PASS' ? 'text-red-500 hover:bg-red-50' : 'text-green-500 hover:bg-green-50';
 
-    const wbOut = window.XLSX.write(item.wb, { bookType: 'xlsx', type: 'array' });
-    const blob = new Blob([wbOut], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-
+    // MODIFICATION: Blob URL Excel dihilangkan dari DOM agar menghemat memory.
+    // Kita panggil window.appActions.downloadSingleExcel() untuk generate on-the-fly.
     actionCell.innerHTML = `
         <div class="flex items-center justify-center gap-2">
             <button onclick="window.appActions.openVisualizer('${item.fileName}')" class="bg-slate-100 hover:bg-slate-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-slate-700 dark:text-white p-2 rounded-lg transition" title="Visualize">
@@ -86,9 +85,9 @@ export function updateRowStatusUI(rowId, item) {
             <button onclick="window.appActions.toggleForceStatus('${item.fileName}')" class="bg-white border border-gray-200 dark:bg-gray-800 dark:border-gray-600 ${toggleColor} p-2 rounded-lg transition" title="${toggleTitle}">
                <i class="fa-solid ${toggleIcon}"></i>
             </button>
-            <a href="${url}" download="VALIDATED_v4_${item.fileName}" class="bg-blue-50 hover:bg-blue-100 dark:bg-blue-900/20 dark:hover:bg-blue-900/40 text-blue-600 dark:text-blue-300 p-2 rounded-lg transition" title="Download XLSX">
+            <button onclick="window.appActions.downloadSingleExcel('${item.fileName}')" class="bg-blue-50 hover:bg-blue-100 dark:bg-blue-900/20 dark:hover:bg-blue-900/40 text-blue-600 dark:text-blue-300 p-2 rounded-lg transition" title="Download XLSX">
                <i class="fa-solid fa-file-excel"></i>
-            </a>
+            </button>
             <button onclick="window.appActions.downloadSapTxt('${item.fileName}')" class="bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-900/20 dark:hover:bg-emerald-900/40 text-emerald-600 dark:text-emerald-300 p-2 rounded-lg transition" title="Download SAP TXT">
                <i class="fa-solid fa-file-code"></i>
             </button>
@@ -174,9 +173,10 @@ export async function startBatchValidation() {
     appState.stats.warning = 0;
     updateDashboardUI();
 
-    for (const item of appState.queue) {
-        await processFile(item.file, item.id);
-    }
+    // Jalankan pemrosesan asinkron untuk seluruh queue.
+    // Karena menggunakan Web Worker, UI tidak akan freeze meskipun ada 100+ file.
+    const processPromises = appState.queue.map(item => processFile(item.file, item.id));
+    await Promise.all(processPromises);
     
     appState.queue = []; 
     btn.innerHTML = "<i class='fa-solid fa-check mr-2'></i> Done";
@@ -190,7 +190,7 @@ export async function startBatchValidation() {
     }, 2000);
 }
 
-// Membaca file dan mempersiapkan array sebelum dilempar ke logic validasi murni
+// Membaca file dan mengirim data ke Web Worker
 async function processFile(file, rowId) {
     const row = document.getElementById(rowId);
     if (!row) return;
@@ -201,53 +201,97 @@ async function processFile(file, rowId) {
     const actionCell = row.cells[5];
 
     statusCell.innerHTML = `<span class="loader"></span>`;
-    msgCell.innerText = "Running checks...";
+    msgCell.innerText = "Processing via Worker...";
 
     try {
         const arrayBuffer = await file.arrayBuffer();
-        const workbook = window.XLSX.read(arrayBuffer, { type: 'array' });
+        const anchorPid = extractAnchorPid(file.name);
         
-        if (!workbook.SheetNames.includes('below_ring')) throw new Error("Sheet 'below_ring' tidak ditemukan.");
-        
-        let rawBelow = window.XLSX.utils.sheet_to_json(workbook.Sheets['below_ring'], { defval: "" });
-        
-        let belowData = rawBelow.map((r, idx) => {
-            const newRow = {};
-            Object.keys(r).forEach(k => {
-                const upperK = k.toUpperCase().trim();
-                if (['PID', 'RING_ID'].includes(upperK)) return; 
-                newRow[upperK] = r[k];
-            });
-            // Hapus rowIndex init di sini karena akan di-recalc di executeValidation
-            return newRow;
-        });
-
-        const required = ['STRNO', 'PLTXT', 'ABCKZ'];
-        const missing = required.filter(c => !Object.keys(belowData[0] || {}).includes(c));
-        if (missing.length) throw new Error(`Kolom hilang di below_ring: ${missing.join(', ')}`);
-
-        // Sort Data pada pemrosesan AWAL SAJA
-        belowData.sort((a, b) => String(a.STRNO || "").localeCompare(String(b.STRNO || "")));
-
-        let displayData = [];
-        if (workbook.SheetNames.includes('display_ring')) {
-            const rawDisplay = window.XLSX.utils.sheet_to_json(workbook.Sheets['display_ring'], { defval: "" });
-            displayData = rawDisplay.map(r => {
-                const newRow = {};
-                Object.keys(r).forEach(k => newRow[k.toUpperCase().trim()] = r[k]);
-                return newRow;
+        // Convert Map ke Object biasa agar bisa dikirim via postMessage ke Worker
+        const workCenterMapObj = {};
+        if (appState.workCenterData) {
+            appState.workCenterData.forEach((val, key) => {
+                workCenterMapObj[key] = val;
             });
         }
 
-        const anchorPid = extractAnchorPid(file.name);
+        // Jalankan worker sebagai Promise
+        const workerResult = await new Promise((resolve, reject) => {
+            const worker = new Worker('./src/workers/excelWorker.js');
+            
+            worker.onmessage = function(e) {
+                resolve(e.data);
+                worker.terminate(); // Pastikan worker dimatikan setelah selesai untuk hemat RAM
+            };
+            
+            worker.onerror = function(err) {
+                reject(err);
+                worker.terminate();
+            };
+            
+            // Kirim data ke worker
+            worker.postMessage({
+                fileBuffer: arrayBuffer,
+                fileName: file.name,
+                anchorPid: anchorPid,
+                workCenterMap: workCenterMapObj
+            });
+        });
 
-        // Eksekusi Logika Validasi (Bisa dipanggil ulang saat Re-Validate)
-        await executeValidation(file.name, anchorPid, belowData, displayData, rowId, false);
+        // Tangani hasil dari Worker
+        if (!workerResult.success) {
+            throw new Error(workerResult.error);
+        }
+
+        // Update statistik
+        appState.stats.total++;
+        if(workerResult.status === "PASS") {
+            appState.stats.pass++;
+            GameSystem.addXP(10, "Validation Passed");
+        } else if (workerResult.status === "FAIL") {
+            appState.stats.fail++;
+        } else {
+            appState.stats.warning++; 
+        }
+
+        // Simpan Hasil ke Memory AppState (Tanpa menyimpan `wb` utuh untuk hemat RAM)
+        appState.processed[workerResult.fileName] = {
+            fileName: workerResult.fileName,
+            belowData: workerResult.belowData,
+            displayData: workerResult.displayData,
+            pid: workerResult.pid, 
+            status: workerResult.status,
+            errors: workerResult.errors,
+            warnings: workerResult.warnings, 
+            sapTxt: workerResult.sapTxt,
+            rowId: rowId,
+            isManuallyOverridden: false 
+        };
+        
+        appState.processedKeys = Object.keys(appState.processed);
+
+        updateDashboardUI();
+        updateRowStatusUI(rowId, appState.processed[workerResult.fileName]);
+        updateTableRowVerifiedStatus(rowId, anchorPid);
+
+        if (workerResult.status === "PASS") {
+            msgCell.innerHTML = "<span class='text-green-600 dark:text-green-400 font-medium'><i class='fa-solid fa-check-circle mr-1'></i> Validated Successfully</span>";
+        } else if (workerResult.status === "WARNING") {
+            msgCell.innerHTML = `<span class='text-orange-600 dark:text-orange-400 font-medium'><i class='fa-solid fa-triangle-exclamation mr-1'></i> Found ${workerResult.warnings.length} warnings</span>`;
+        } else {
+            msgCell.innerHTML = `<span class='text-red-600 dark:text-red-400 font-medium'><i class='fa-solid fa-xmark mr-1'></i> Found ${workerResult.errors.length} errors</span>`;
+        }
+
+        if(appState.currentQueueFilter && appState.currentQueueFilter !== 'all') {
+            filterQueueTable();
+        } else if(document.getElementById('queueSearch') && document.getElementById('queueSearch').value.trim() !== "") {
+            filterQueueTable();
+        }
 
     } catch (err) {
         console.error(err);
         statusCell.innerHTML = `<span class="bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-300 py-1 px-3 rounded-md text-xs font-bold uppercase">Error</span>`;
-        msgCell.innerText = err.message;
+        msgCell.innerText = err.message || "Failed processing in worker";
         verifiedCell.innerHTML = "-";
         actionCell.innerHTML = "-";
         appState.stats.total++;
@@ -257,7 +301,8 @@ async function processFile(file, rowId) {
 }
 
 // --- LOGIKA VALIDASI MURNI (RULES R5 - R20) ---
-// Dipisahkan agar bisa dipakai untuk initial load maupun saat Re-Validate hasil editan
+// FUNGSI LAMA TIDAK DIHAPUS, digunakan khusus untuk Re-Validate di dalam tab Edit (Visualizer).
+// Karena ini hanya dijalankan 1 per 1 file, tidak akan membuat UI freeze.
 
 async function executeValidation(fileName, anchorPid, belowData, displayData, rowId, isRevalidation = false) {
     const row = document.getElementById(rowId);
@@ -273,7 +318,6 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
     }
 
     try {
-        // Kalkulasi ulang Row Index & Length (Penting jika user merubah urutan / teks via Edit Mode)
         belowData.forEach((r, idx) => {
             r._rowIndex = idx + 2; 
             const s = String(r.STRNO || "");
@@ -419,9 +463,6 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
         });
 
         const segments = belowData.filter(r => r.STRNO_LENGTH === 21);
-        // Mempertahankan urutan index saat revalidation, bukan mensortir ulang berdasarkan text
-        // segments.sort((a,b) => String(a.STRNO||"").localeCompare(String(b.STRNO||"")));
-
         for(let k=0; k < segments.length - 1; k++) {
             const curr = segments[k];
             const next = segments[k+1];
@@ -527,20 +568,6 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
         if (errors.length > 0) statusStr = "FAIL";
         else if (warnings.length > 0) statusStr = "WARNING";
 
-        if (!isRevalidation) {
-            appState.stats.total++;
-            if(statusStr === "PASS") {
-                appState.stats.pass++;
-                GameSystem.addXP(10, "Validation Passed");
-            } else if (statusStr === "FAIL") {
-                appState.stats.fail++;
-            } else {
-                appState.stats.warning++; 
-            }
-        }
-
-        const newWb = window.XLSX.utils.book_new();
-        
         const exportBelowData = belowData.map(r => {
             const { STRNO_LENGTH, _rowIndex, ...rest } = r;
             return rest;
@@ -550,27 +577,9 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
         const headerOrder = ['STRNO', ...allKeys.filter(k => k!=='STRNO')]; 
         const sapTxt = buildSapTxtFromRows(exportBelowData, headerOrder);
 
-        const wsBelow = window.XLSX.utils.json_to_sheet(exportBelowData, { header: headerOrder });
-        window.XLSX.utils.book_append_sheet(newWb, wsBelow, "below_ring");
-
-        if (displayData.length) {
-            const wsDisplay = window.XLSX.utils.json_to_sheet(displayData);
-            window.XLSX.utils.book_append_sheet(newWb, wsDisplay, "display_ring");
-        }
-
-        if (errors.length > 0) {
-            const wsErr = window.XLSX.utils.json_to_sheet(errors);
-            window.XLSX.utils.book_append_sheet(newWb, wsErr, "ERROR_LOG");
-        }
-        if (warnings.length > 0) {
-             const wsWarn = window.XLSX.utils.json_to_sheet(warnings);
-             window.XLSX.utils.book_append_sheet(newWb, wsWarn, "WARNING_LOG");
-        }
-
-        // Simpan Hasil ke Memory AppState
+        // Update state saat revalidasi (di sini kita sudah tidak simpan wb lagi)
         appState.processed[fileName] = {
             fileName: fileName,
-            wb: newWb, 
             belowData: belowData,
             displayData: displayData,
             pid: anchorPid, 
@@ -582,12 +591,7 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
             isManuallyOverridden: false 
         };
         
-        if (!isRevalidation) {
-            appState.processedKeys = Object.keys(appState.processed);
-        } else {
-            // Update the global stats to account for the new status
-            recalculateStats();
-        }
+        recalculateStats();
 
         updateDashboardUI();
         updateRowStatusUI(rowId, appState.processed[fileName]);
@@ -629,7 +633,8 @@ export async function revalidateEditedData() {
     showToast("Memproses ulang validasi...", "info");
 
     try {
-        // Panggil ulang logika validasi bermodalkan data yang telah diubah
+        // Panggil ulang logika validasi (Sync/Main Thread) bermodalkan data yang telah diubah
+        // Karena cuma 1 file yang diubah manual oleh user, performanya akan sangat cepat tanpa Worker
         const updatedItem = await executeValidation(item.fileName, item.pid, item.belowData, item.displayData, item.rowId, true);
         
         // --- Update UI Visualizer ---
@@ -645,11 +650,10 @@ export async function revalidateEditedData() {
             badge.innerText = updatedItem.status;
         }
 
-        // Merender ulang komponen visual dengan Promise dinamis (mengatasi circular dependency)
         import('../ui/tables.js').then(m => {
             m.renderErrorTable([...updatedItem.errors, ...(updatedItem.warnings || [])]);
             m.renderDisplayRingTable(updatedItem.displayData);
-            m.filterTable(true); // Mempertahankan pagination page (true)
+            m.filterTable(true);
         });
 
         import('../ui/visualizer.js').then(m => {
@@ -684,6 +688,5 @@ export function toggleForceStatus(fileName) {
     showToast(`Status updated to ${item.status}`, item.status === 'PASS' ? 'success' : 'error');
 }
 
-// Ekspos ke global context agar terbaca dari script di UI (tables.js binding)
 window.appActions = window.appActions || {};
 window.appActions.revalidateEditedData = revalidateEditedData;
