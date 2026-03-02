@@ -2,7 +2,17 @@
  * src/ui/visualizer.js
  * Mengatur semua logika untuk merender visualisasi topologi (SVG),
  * serta mengurus fitur zoom, pan (drag layar), dan resize.
+ * Update Phase 2: Integrasi appEventBus agar visualizer otomatis update saat re-validasi.
  */
+
+import { appEventBus } from '../utils/eventBus.js'; // IMPORT EVENT BUS BARU
+
+// --- EVENT SUBSCRIBER (PHASE 2) ---
+// Ketika data selesai direvalidasi, otomatis perbarui gambar topologi SVG
+appEventBus.on('DATA_REVALIDATED', (updatedItem) => {
+    generateSVG(updatedItem.displayData, updatedItem.belowData, updatedItem.pid);
+});
+
 
 let vizScale = 1.0;
 
