@@ -1,8 +1,7 @@
 /**
  * src/services/validatorService.js
  * Menangani antrean file, proses validasi, dan pengecekan Rules (R5-R20).
- * Update Phase 1: Integrasi Web Worker untuk proses masif agar UI tidak freeze.
- * Memory Optimization: Tidak lagi menyimpan objek XLSX.Workbook utuh di RAM.
+ * Update Phase 1.1: Fix Worker Path & Mencegah Thread Bombing (Browser Crash).
  */
 
 import { appState, recalculateStats, clearValidatorState } from '../state/store.js';
@@ -75,8 +74,6 @@ export function updateRowStatusUI(rowId, item) {
     const toggleTitle = item.status === 'PASS' ? 'Force Fail' : 'Force Pass';
     const toggleColor = item.status === 'PASS' ? 'text-red-500 hover:bg-red-50' : 'text-green-500 hover:bg-green-50';
 
-    // MODIFICATION: Blob URL Excel dihilangkan dari DOM agar menghemat memory.
-    // Kita panggil window.appActions.downloadSingleExcel() untuk generate on-the-fly.
     actionCell.innerHTML = `
         <div class="flex items-center justify-center gap-2">
             <button onclick="window.appActions.openVisualizer('${item.fileName}')" class="bg-slate-100 hover:bg-slate-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-slate-700 dark:text-white p-2 rounded-lg transition" title="Visualize">
@@ -173,10 +170,12 @@ export async function startBatchValidation() {
     appState.stats.warning = 0;
     updateDashboardUI();
 
-    // Jalankan pemrosesan asinkron untuk seluruh queue.
-    // Karena menggunakan Web Worker, UI tidak akan freeze meskipun ada 100+ file.
-    const processPromises = appState.queue.map(item => processFile(item.file, item.id));
-    await Promise.all(processPromises);
+    // FIXED: Sequential Processing.
+    // Memproses file secara berurutan agar hanya ada 1 Web Worker yang aktif pada satu waktu.
+    // Ini mencegah browser crash jika user mengunggah ratusan file sekaligus.
+    for (const item of appState.queue) {
+        await processFile(item.file, item.id);
+    }
     
     appState.queue = []; 
     btn.innerHTML = "<i class='fa-solid fa-check mr-2'></i> Done";
@@ -207,7 +206,6 @@ async function processFile(file, rowId) {
         const arrayBuffer = await file.arrayBuffer();
         const anchorPid = extractAnchorPid(file.name);
         
-        // Convert Map ke Object biasa agar bisa dikirim via postMessage ke Worker
         const workCenterMapObj = {};
         if (appState.workCenterData) {
             appState.workCenterData.forEach((val, key) => {
@@ -215,13 +213,13 @@ async function processFile(file, rowId) {
             });
         }
 
-        // Jalankan worker sebagai Promise
         const workerResult = await new Promise((resolve, reject) => {
-            const worker = new Worker('./src/workers/excelWorker.js');
+            // FIXED PATH: Menggunakan ./src/excelWorker.js sesuai struktur repo yang diunggah
+            const worker = new Worker('./src/excelWorker.js');
             
             worker.onmessage = function(e) {
                 resolve(e.data);
-                worker.terminate(); // Pastikan worker dimatikan setelah selesai untuk hemat RAM
+                worker.terminate(); 
             };
             
             worker.onerror = function(err) {
@@ -229,7 +227,6 @@ async function processFile(file, rowId) {
                 worker.terminate();
             };
             
-            // Kirim data ke worker
             worker.postMessage({
                 fileBuffer: arrayBuffer,
                 fileName: file.name,
@@ -238,12 +235,10 @@ async function processFile(file, rowId) {
             });
         });
 
-        // Tangani hasil dari Worker
         if (!workerResult.success) {
             throw new Error(workerResult.error);
         }
 
-        // Update statistik
         appState.stats.total++;
         if(workerResult.status === "PASS") {
             appState.stats.pass++;
@@ -254,7 +249,6 @@ async function processFile(file, rowId) {
             appState.stats.warning++; 
         }
 
-        // Simpan Hasil ke Memory AppState (Tanpa menyimpan `wb` utuh untuk hemat RAM)
         appState.processed[workerResult.fileName] = {
             fileName: workerResult.fileName,
             belowData: workerResult.belowData,
@@ -301,8 +295,7 @@ async function processFile(file, rowId) {
 }
 
 // --- LOGIKA VALIDASI MURNI (RULES R5 - R20) ---
-// FUNGSI LAMA TIDAK DIHAPUS, digunakan khusus untuk Re-Validate di dalam tab Edit (Visualizer).
-// Karena ini hanya dijalankan 1 per 1 file, tidak akan membuat UI freeze.
+// Digunakan khusus untuk Re-Validate di dalam tab Edit (Visualizer).
 
 async function executeValidation(fileName, anchorPid, belowData, displayData, rowId, isRevalidation = false) {
     const row = document.getElementById(rowId);
@@ -577,7 +570,7 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
         const headerOrder = ['STRNO', ...allKeys.filter(k => k!=='STRNO')]; 
         const sapTxt = buildSapTxtFromRows(exportBelowData, headerOrder);
 
-        // Update state saat revalidasi (di sini kita sudah tidak simpan wb lagi)
+        // Update state saat revalidasi (tidak simpan wb lagi)
         appState.processed[fileName] = {
             fileName: fileName,
             belowData: belowData,
@@ -633,11 +626,8 @@ export async function revalidateEditedData() {
     showToast("Memproses ulang validasi...", "info");
 
     try {
-        // Panggil ulang logika validasi (Sync/Main Thread) bermodalkan data yang telah diubah
-        // Karena cuma 1 file yang diubah manual oleh user, performanya akan sangat cepat tanpa Worker
         const updatedItem = await executeValidation(item.fileName, item.pid, item.belowData, item.displayData, item.rowId, true);
         
-        // --- Update UI Visualizer ---
         const badge = document.getElementById('vizStatusBadge');
         if (badge) {
             if (updatedItem.status === 'PASS') {
