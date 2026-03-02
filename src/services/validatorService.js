@@ -213,9 +213,8 @@ async function processFile(file, rowId) {
 
         const workerResult = await new Promise((resolve, reject) => {
             // FIXED PATH FOR GITHUB PAGES: Menggunakan teknik import.meta.url
-            // Ini akan meresolve path relatif terhadap file validatorService.js
-            // Karena validatorService.js ada di `src/services/` dan worker di `src/`, kita pakai `../`
-            const workerUrl = new URL('../excelWorker.js', import.meta.url);
+            // Path disesuaikan menuju `../workers/excelWorker.js` karena file ada di dalam folder workers
+            const workerUrl = new URL('../workers/excelWorker.js', import.meta.url);
             const worker = new Worker(workerUrl);
             
             worker.onmessage = function(e) {
