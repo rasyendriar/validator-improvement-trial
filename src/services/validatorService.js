@@ -180,7 +180,7 @@ export async function startBatchValidation() {
     // PHASE 3: Inisialisasi dengan { type: 'module' }
     for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
         const workerUrl = new URL('../workers/excelWorker.js', import.meta.url);
-        const w = new Worker(workerUrl, { type: 'module' }); 
+        const w = new Worker(workerUrl); 
         
         w.onmessage = (e) => {
             const data = e.data;
@@ -488,3 +488,4 @@ export function toggleForceStatus(fileName) {
 
 window.appActions = window.appActions || {};
 window.appActions.revalidateEditedData = revalidateEditedData;
+
