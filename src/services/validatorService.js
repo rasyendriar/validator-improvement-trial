@@ -1,7 +1,7 @@
 /**
  * src/services/validatorService.js
  * Menangani antrean file, proses validasi, dan pengecekan Rules (R5-R20).
- * Update Phase 1.2: Fix Worker Path Issue for GitHub Pages using import.meta.url
+ * Update Phase 1.3: High-Performance Worker Pool & Concurrency Limiter.
  */
 
 import { appState, recalculateStats, clearValidatorState } from '../state/store.js';
@@ -156,6 +156,7 @@ export function clearValidatorQueue() {
     if(fileElem) fileElem.value = '';
 }
 
+// 🚀 FUNGSI BATCH UTAMA DENGAN WORKER POOL (ENTERPRISE GRADE)
 export async function startBatchValidation() {
     const btn = document.getElementById('btnStartValidation');
     if (!btn) return;
@@ -170,10 +171,58 @@ export async function startBatchValidation() {
     appState.stats.warning = 0;
     updateDashboardUI();
 
-    // Memproses file secara berurutan agar hanya ada 1 Web Worker yang aktif pada satu waktu
-    for (const item of appState.queue) {
-        await processFile(item.file, item.id);
+    // 1. Tentukan Concurrency Limit (Maksimal 6 worker untuk mencegah RAM jebol, optimal untuk performa)
+    const CONCURRENCY_LIMIT = Math.min(navigator.hardwareConcurrency || 4, 6);
+    const workers = [];
+    const pendingResolvers = new Map(); // Untuk mencocokkan hasil dari worker ke file yang tepat
+
+    // 2. Inisialisasi Worker Pool (Worker di-create SATU KALI saja, menghindari loading SheetJS berulang)
+    for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
+        const workerUrl = new URL('../workers/excelWorker.js', import.meta.url);
+        const w = new Worker(workerUrl);
+        
+        // Listener global untuk worker ini
+        w.onmessage = (e) => {
+            const data = e.data;
+            if (data && data.fileName && pendingResolvers.has(data.fileName)) {
+                // Selesaikan Promise dari file yang bersangkutan
+                pendingResolvers.get(data.fileName)(data);
+            }
+        };
+        
+        w.onerror = (err) => console.error(`Worker [${i}] Global Error:`, err);
+        workers.push(w);
     }
+
+    // 3. Sistem Antrean (Queue System) - Membagi file ke worker yang kosong
+    let currentIndex = 0;
+    const queue = [...appState.queue];
+    
+    // Fungsi untuk 1 Worker memproses antrean secara beruntun sampai habis
+    const processNextInPool = async (workerId) => {
+        const worker = workers[workerId];
+        
+        while (currentIndex < queue.length) {
+            const itemIndex = currentIndex++;
+            const item = queue[itemIndex];
+            
+            // Tunggu 1 file selesai, lalu otomatis ambil file selanjutnya (No idle time)
+            await processFileWithWorker(item.file, item.id, worker, pendingResolvers);
+        }
+    };
+
+    // 4. Jalankan X buah "Thread" secara bersamaan
+    const threads = [];
+    for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
+        threads.push(processNextInPool(i));
+    }
+
+    // 5. Tunggu semua thread selesai menghabiskan antrean
+    await Promise.all(threads);
+
+    // 6. Cleanup: Matikan semua worker untuk membebaskan RAM
+    workers.forEach(w => w.terminate());
+    pendingResolvers.clear();
     
     appState.queue = []; 
     btn.innerHTML = "<i class='fa-solid fa-check mr-2'></i> Done";
@@ -187,8 +236,8 @@ export async function startBatchValidation() {
     }, 2000);
 }
 
-// Membaca file dan mengirim data ke Web Worker
-async function processFile(file, rowId) {
+// Mengeksekusi 1 file spesifik ke Worker yang di-assign
+async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
     const row = document.getElementById(rowId);
     if (!row) return;
 
@@ -211,23 +260,12 @@ async function processFile(file, rowId) {
             });
         }
 
-        const workerResult = await new Promise((resolve, reject) => {
-            // FIXED PATH FOR GITHUB PAGES: Menggunakan teknik import.meta.url
-            // Path disesuaikan menuju `../workers/excelWorker.js` karena file ada di dalam folder workers
-            const workerUrl = new URL('../workers/excelWorker.js', import.meta.url);
-            const worker = new Worker(workerUrl);
+        // Tunggu hasil dari Worker
+        const workerResult = await new Promise((resolve) => {
+            // Daftarkan fungsi resolve ke Map menggunakan nama file sebagai kunci ID
+            pendingResolvers.set(file.name, resolve);
             
-            worker.onmessage = function(e) {
-                resolve(e.data);
-                worker.terminate(); 
-            };
-            
-            worker.onerror = function(err) {
-                console.error("Worker Execution Error:", err);
-                reject(new Error("Gagal mengeksekusi Web Worker. Kemungkinan masalah koneksi atau parsing."));
-                worker.terminate();
-            };
-            
+            // Kirim tugas ke Worker
             worker.postMessage({
                 fileBuffer: arrayBuffer,
                 fileName: file.name,
@@ -236,10 +274,12 @@ async function processFile(file, rowId) {
             });
         });
 
+        // Tangani jika ada exception di dalam excelWorker.js
         if (!workerResult.success) {
             throw new Error(workerResult.error);
         }
 
+        // --- UPDATE STATE & UI ---
         appState.stats.total++;
         if(workerResult.status === "PASS") {
             appState.stats.pass++;
@@ -292,6 +332,9 @@ async function processFile(file, rowId) {
         appState.stats.total++;
         appState.stats.fail++;
         updateDashboardUI();
+    } finally {
+        // Hapus dari map memori setelah selesai
+        pendingResolvers.delete(file.name);
     }
 }
 
