@@ -5,21 +5,20 @@
  * - Rendering Tabel Data Display Ring
  * - Rendering Tabel Data Tenant (beserta Pagination)
  * - Rendering Tabel Error/Warning Log
- * - FITUR BARU: Edit Mode & Smart Group Drag-and-Drop Reordering
- * - IMPROVEMENT PHASE 2: Integrasi EventBus & Smart Error Highlight (Click-to-Row)
+ * - Edit Mode & Smart Group Drag-and-Drop Reordering
+ * - Integrasi EventBus & Smart Error Highlight (Click-to-Row)
  */
 
 import { appState } from '../state/store.js';
 import { showToast } from './modals.js';
-import { appEventBus } from '../utils/eventBus.js'; // IMPORT EVENT BUS BARU
+import { appEventBus } from '../utils/eventBus.js'; 
 
-// --- EVENT SUBSCRIBER (PHASE 2) ---
-// Mendengarkan event revalidasi agar tabel otomatis merender ulang tanpa circular dependency
+// --- EVENT SUBSCRIBER ---
 appEventBus.on('DATA_REVALIDATED', (updatedItem) => {
     const combinedErrors = [...updatedItem.errors, ...(updatedItem.warnings || [])];
     renderErrorTable(combinedErrors);
     renderDisplayRingTable(updatedItem.displayData);
-    filterTable(true); // Paksa render ulang data tenant
+    filterTable(true); 
 });
 
 // --- STATE EDIT MODE ---
@@ -42,7 +41,6 @@ export function toggleEditMode() {
         }
     }
     
-    // Render ulang tabel agar masuk/keluar dari mode edit secara visual
     const currentFileName = appState.processedKeys[appState.currentFileIndex];
     if (currentFileName && appState.processed[currentFileName]) {
         const item = appState.processed[currentFileName];
@@ -62,7 +60,7 @@ function handleDragStart(e, idx) {
 
 function handleDragOver(e) {
     if (!isEditMode) return;
-    if (e.preventDefault) e.preventDefault(); // Diperlukan agar bisa di-drop
+    if (e.preventDefault) e.preventDefault(); 
     e.dataTransfer.dropEffect = 'move';
     return false;
 }
@@ -177,7 +175,6 @@ export function renderDisplayRingTable(displayData) {
         const tr = document.createElement('tr');
         tr.className = "hover:bg-gray-50 dark:hover:bg-gray-800/50 transition";
         
-        // Setup Drag and Drop events if Edit Mode
         if (isEditMode) {
             tr.draggable = true;
             tr.addEventListener('dragstart', (e) => handleDragStart(e, idx));
@@ -191,12 +188,11 @@ export function renderDisplayRingTable(displayData) {
                 if (dragSrcIndex !== idx) {
                     const itemToMove = displayData.splice(dragSrcIndex, 1)[0];
                     displayData.splice(idx, 0, itemToMove);
-                    renderDisplayRingTable(displayData); // Rerender
+                    renderDisplayRingTable(displayData); 
                 }
                 return false;
             });
             
-            // Kolom icon Drag Handle
             const tdDrag = document.createElement('td');
             tdDrag.className = "px-2 py-2 border-b border-gray-50 dark:border-gray-800 text-center drag-handle select-none";
             tdDrag.innerHTML = '<i class="fa-solid fa-grip-lines"></i>';
@@ -208,7 +204,6 @@ export function renderDisplayRingTable(displayData) {
             td.className = "px-4 py-2 border-b border-gray-50 dark:border-gray-800 text-slate-600 dark:text-gray-300 whitespace-nowrap";
             td.innerText = row[col] || '-';
             
-            // Setup Content Editable if Edit Mode
             if (isEditMode) {
                 td.contentEditable = "true";
                 td.addEventListener('blur', (e) => {
@@ -254,11 +249,11 @@ export function renderErrorTable(errors) {
 
         // --- SMART HIGHLIGHT: Modifikasi Row Menjadi Tombol ---
         let rowDisplay = err.Row;
-        // Cek apakah err.Row berupa baris angka Excel
-        let isClickableRow = typeof err.Row === 'number' || (typeof err.Row === 'string' && !isNaN(parseInt(err.Row)));
+        // Gunakan parseInt untuk memastikan row number dibaca sebagai angka yang valid
+        const parsedRow = parseInt(err.Row);
         
-        if (isClickableRow) {
-            rowDisplay = `<button onclick="window.appActions.scrollToRow(${err.Row})" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 underline font-medium cursor-pointer transition-colors" title="Klik untuk melihat baris ini di Tenant Data">Baris ${err.Row}</button>`;
+        if (!isNaN(parsedRow)) {
+            rowDisplay = `<button onclick="window.appActions.scrollToRow(${parsedRow})" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 underline font-medium cursor-pointer transition-colors" title="Klik untuk melihat baris ini di Tenant Data">Baris ${parsedRow}</button>`;
         }
 
         tr.className = `${rowClass} transition border-b border-gray-100 dark:border-gray-800`;
@@ -292,6 +287,7 @@ export function filterTable(keepPage = false) {
     const term = input ? input.value.toLowerCase() : '';
     const lenFilter = appState.currentLenFilter;
 
+    // Gunakan currentData (semua data baris) sebagai basis filtering
     appState.filteredData = appState.currentData.filter(row => {
         const strno = String(row.STRNO || "").toLowerCase();
         const pltxt = String(row.PLTXT || "").toLowerCase();
@@ -360,7 +356,6 @@ export function renderTablePage() {
     const thead = document.getElementById('data-table-head');
     if (!tbody) return;
 
-    // Inject/Remove header drag column untuk mode edit
     if (thead) {
         const trHead = thead.querySelector('tr');
         if (trHead) {
@@ -387,17 +382,17 @@ export function renderTablePage() {
     pageData.forEach((row, idx) => {
         const tr = document.createElement('tr');
         
-        // --- INJEKSI ID UNTUK SCROLLING (PHASE 2) ---
-        // Kita menggunakan _rowIndex yang sudah digenerate dari excelWorker saat validasi awal
-        if (row._rowIndex) {
-            tr.id = `tenant-row-${row._rowIndex}`;
-        }
+        // --- INJEKSI ID ---
+        // Memberikan ID pada elemen TR berdasarkan _rowIndex (baris Excel asli)
+        // Jika _rowIndex tidak ada, kita fallback ke nomor index global array agar tetap punya ID
+        const rowIdNum = row._rowIndex || (appState.currentData.indexOf(row) + 2); 
+        tr.id = `tenant-row-${rowIdNum}`;
 
         const pltxt = String(row.PLTXT || "");
         const isMatch = appState.targetPID && pltxt.includes(appState.targetPID);
         
         if (isMatch && !isEditMode) tr.classList.add('row-highlight');
-        else if (isMatch && isEditMode) tr.classList.add('bg-red-50/30', 'dark:bg-red-900/10'); // Highlight lebih soft di mode edit
+        else if (isMatch && isEditMode) tr.classList.add('bg-red-50/30', 'dark:bg-red-900/10'); 
         
         if (isEditMode) {
             tr.draggable = true;
@@ -417,7 +412,6 @@ export function renderTablePage() {
                     const srcStrno = String(srcObj.STRNO || "");
                     const targetStrno = String(targetObj.STRNO || "");
 
-                    // 1. Kumpulkan semua row untuk dipindahkan & row yang tersisa
                     const itemsToMove = [];
                     const remainingData = [];
                     for (let i = 0; i < appState.currentData.length; i++) {
@@ -428,42 +422,32 @@ export function renderTablePage() {
                         }
                     }
 
-                    // 2. Modifikasi Array secara IN-PLACE. 
-                    // Ini penting agar referensi memori global (item.belowData) ikut berubah
                     appState.currentData.length = 0; 
                     appState.currentData.push(...remainingData);
 
-                    // 3. Cari posisi global (index) dari target drop di array yang sudah dikurangi tadi
                     let targetGlobalIdx = appState.currentData.findIndex(item => item === targetObj);
 
                     if (targetGlobalIdx > -1) {
-                        // Jika arah drag ke Bawah (index awal lebih kecil dari index drop di UI)
                         if (dragSrcIndex < idx) {
-                            // Kita harus melewati target beserta seluruh "anak-anak" dari target tersebut
-                            // agar grup yang ditarik ditempatkan tepat SETELAH grup target
                             let lastChildIdx = targetGlobalIdx;
                             while (lastChildIdx + 1 < appState.currentData.length && 
                                    String(appState.currentData[lastChildIdx + 1].STRNO || "").startsWith(targetStrno)) {
                                 lastChildIdx++;
                             }
-                            targetGlobalIdx = lastChildIdx + 1; // Posisi insert setelah anak target terakhir
+                            targetGlobalIdx = lastChildIdx + 1; 
                         }
                         
-                        // 4. Masukkan kembali grup data ke posisi barunya secara IN-PLACE
                         appState.currentData.splice(targetGlobalIdx, 0, ...itemsToMove);
                     } else {
-                        // Fallback jika targetObj tidak ketemu
                         appState.currentData.push(...itemsToMove);
                     }
 
-                    // Render ulang dan terapkan filter
                     filterTable(true); 
                 }
                 return false;
             });
         }
 
-        // Helper string
         let tdDrag = isEditMode ? `<td class="py-2 px-2 border-b border-gray-50 dark:border-gray-800 text-center drag-handle select-none"><i class="fa-solid fa-grip-lines"></i></td>` : '';
         const buildCell = (val, key, extClass = "") => {
             return `<td class="py-2 px-6 border-b border-gray-50 dark:border-gray-800 text-sm ${extClass}" ${isEditMode ? `contenteditable="true" data-key="${key}"` : ''}>${val || '-'}</td>`;
@@ -488,7 +472,7 @@ export function renderTablePage() {
                     if (row[key] !== newVal) {
                         row[key] = newVal;
                         if (key === 'STRNO') {
-                            row.STRNO_LENGTH = newVal.length; // Otomatis perbarui STRNO_LENGTH jika diubah
+                            row.STRNO_LENGTH = newVal.length; 
                         }
                     }
                 });
@@ -499,9 +483,7 @@ export function renderTablePage() {
     });
 }
 
-// Inisialisasi event listener untuk elemen-elemen UI tabel
 export function initTableEvents() {
-    // Queue filter events
     ['all', 'pass', 'warning', 'fail'].forEach(status => {
         const btn = document.getElementById(`filter-btn-${status}`);
         if(btn) btn.addEventListener('click', () => setQueueFilter(status));
@@ -510,7 +492,6 @@ export function initTableEvents() {
     const queueSearch = document.getElementById('queueSearch');
     if(queueSearch) queueSearch.addEventListener('keyup', filterQueueTable);
 
-    // Tenant data filter events
     ['all', '17', '21', '26', '30'].forEach(len => {
         const btn = document.getElementById(`len-btn-${len}`);
         if(btn) btn.addEventListener('click', () => setLenFilter(len));
@@ -526,12 +507,12 @@ export function initTableEvents() {
     if(btnNext) btnNext.addEventListener('click', () => changePage(1));
 }
 
-// --- FUNGSI SCROLL SMART HIGHLIGHT (PHASE 2) ---
+// --- FUNGSI SCROLL SMART HIGHLIGHT (FIXED BUG) ---
 export function scrollToRow(rowNumber) {
-    // 1. Pindah tab ke Tenant Data secara otomatis
+    // 1. Pastikan tab "Tenant Data" aktif. Panggil navigasi global Anda.
     const tenantTabBtn = document.querySelector('[onclick*="switchTab(\\\'tenant\\\')"]') || 
                          document.querySelector('[onclick*="switchTab(\'tenant\')"]') || 
-                         document.getElementById('tab-tenant'); // Sesuaikan selector tab HTML Anda
+                         document.getElementById('tab-tenant'); 
                          
     if (tenantTabBtn) {
         tenantTabBtn.click();
@@ -539,15 +520,47 @@ export function scrollToRow(rowNumber) {
         window.switchTab('tenant');
     }
 
-    // Beri jeda sejenak agar tab selesai render / transisi CSS
+    // 2. Beri jeda agar UI tab selesai transisi
     setTimeout(() => {
-        if (!appState.filteredData) return;
+        if (!appState.currentData) return;
 
-        // 2. Cari di mana posisi data baris tersebut berada (Index-nya)
-        const dataIndex = appState.filteredData.findIndex(r => r._rowIndex === rowNumber);
+        // 3. Reset Filter Jika Sedang Aktif (Penting: agar baris error tidak tersembunyi)
+        const searchInput = document.getElementById('tableSearch');
+        let filterResetted = false;
+        
+        if (searchInput && searchInput.value !== "") {
+            searchInput.value = "";
+            filterResetted = true;
+        }
+        
+        if (appState.currentLenFilter !== 'all') {
+            appState.currentLenFilter = 'all';
+            // Update UI tombol filter kembali ke state 'all'
+            ['all', '17', '21', '26', '30'].forEach(l => {
+                const btn = document.getElementById(`len-btn-${l}`);
+                if(btn) {
+                    btn.className = l === 'all' 
+                        ? "px-3 py-1.5 text-xs font-bold rounded-lg bg-mitratel-red text-white transition shadow-sm whitespace-nowrap"
+                        : "px-3 py-1.5 text-xs font-bold rounded-lg bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 transition whitespace-nowrap";
+                }
+            });
+            filterResetted = true;
+        }
+        
+        // Render ulang tabel utuh tanpa filter
+        if (filterResetted) {
+            filterTable(false); 
+        }
+
+        // 4. Cari posisi baris di keseluruhan data (currentData)
+        // Kita bandingkan dengan `_rowIndex` (jika ada) ATAU fallback ke urutan array + 2
+        const dataIndex = appState.currentData.findIndex((r, idx) => {
+             const currentRowNum = r._rowIndex || (idx + 2);
+             return currentRowNum === rowNumber;
+        });
 
         if (dataIndex !== -1) {
-            // 3. Otomatis Pindah Pagination (Jika barisnya berada di page 2,3, dst)
+            // 5. Pindah Pagination ke halaman tempat baris tersebut berada
             const targetPage = Math.ceil((dataIndex + 1) / appState.rowsPerPage);
             if (appState.currentPage !== targetPage) {
                 appState.currentPage = targetPage;
@@ -555,34 +568,28 @@ export function scrollToRow(rowNumber) {
                 updatePaginationInfo();
             }
 
-            // 4. Lakukan animasi scroll & blink ke elemen baris tersebut
+            // 6. Jalankan animasi Scroll & Blink
             setTimeout(() => {
                 const targetRow = document.getElementById(`tenant-row-${rowNumber}`);
                 if (targetRow) {
                     targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    // Tambahkan class blink (kuning/merah)
-                    targetRow.classList.add('bg-yellow-200', 'dark:bg-yellow-900/50', 'transition-all', 'duration-500');
-                    // Bersihkan class setelah 3 detik
+                    
+                    targetRow.classList.add('bg-yellow-200', 'dark:bg-yellow-900/50', 'transition-all', 'duration-500', 'ring-2', 'ring-yellow-400');
+                    
                     setTimeout(() => {
-                        targetRow.classList.remove('bg-yellow-200', 'dark:bg-yellow-900/50');
+                        targetRow.classList.remove('bg-yellow-200', 'dark:bg-yellow-900/50', 'ring-2', 'ring-yellow-400');
                     }, 3000);
+                } else {
+                    console.warn(`DOM Element tr#tenant-row-${rowNumber} tidak ter-render.`);
+                    showToast(`Baris ${rowNumber} tidak ditemukan di tampilan.`, 'warning');
                 }
-            }, 100); 
+            }, 150); // Jeda render
 
         } else {
-            // Fallback: Jika baris disembunyikan oleh Filter, reset filter dulu lalu coba lagi
-            const searchInput = document.getElementById('tableSearch');
-            if (searchInput && searchInput.value !== "") {
-                searchInput.value = "";
-                filterTable(true);
-                setTimeout(() => scrollToRow(rowNumber), 150);
-            } else {
-                showToast(`Baris ${rowNumber} tidak ditemukan.`, 'warning');
-            }
+            showToast(`Data baris ${rowNumber} tidak ada di memori.`, 'error');
         }
     }, 150);
 }
 
-// Expose fungsi ke global object agar bisa dipanggil dari atribut HTML onclick=""
 window.appActions = window.appActions || {};
 window.appActions.scrollToRow = scrollToRow;
