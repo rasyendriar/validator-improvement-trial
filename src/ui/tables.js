@@ -249,7 +249,6 @@ export function renderErrorTable(errors) {
 
         // --- SMART HIGHLIGHT: Modifikasi Row Menjadi Tombol ---
         let rowDisplay = err.Row;
-        // Gunakan parseInt untuk memastikan row number dibaca sebagai angka yang valid
         const parsedRow = parseInt(err.Row);
         
         if (!isNaN(parsedRow)) {
@@ -287,7 +286,9 @@ export function filterTable(keepPage = false) {
     const term = input ? input.value.toLowerCase() : '';
     const lenFilter = appState.currentLenFilter;
 
-    // Gunakan currentData (semua data baris) sebagai basis filtering
+    // Pastikan appState.currentData ada
+    if (!appState.currentData) return;
+
     appState.filteredData = appState.currentData.filter(row => {
         const strno = String(row.STRNO || "").toLowerCase();
         const pltxt = String(row.PLTXT || "").toLowerCase();
@@ -371,6 +372,10 @@ export function renderTablePage() {
     }
 
     tbody.innerHTML = "";
+    
+    // Safety check
+    if (!appState.filteredData) return;
+
     const startIdx = (appState.currentPage - 1) * appState.rowsPerPage;
     const pageData = appState.filteredData.slice(startIdx, startIdx + appState.rowsPerPage);
 
@@ -382,9 +387,7 @@ export function renderTablePage() {
     pageData.forEach((row, idx) => {
         const tr = document.createElement('tr');
         
-        // --- INJEKSI ID ---
-        // Memberikan ID pada elemen TR berdasarkan _rowIndex (baris Excel asli)
-        // Jika _rowIndex tidak ada, kita fallback ke nomor index global array agar tetap punya ID
+        // INJEKSI ID
         const rowIdNum = row._rowIndex || (appState.currentData.indexOf(row) + 2); 
         tr.id = `tenant-row-${rowIdNum}`;
 
@@ -507,60 +510,65 @@ export function initTableEvents() {
     if(btnNext) btnNext.addEventListener('click', () => changePage(1));
 }
 
-// --- FUNGSI SCROLL SMART HIGHLIGHT (FIXED BUG) ---
+// --- FUNGSI SCROLL SMART HIGHLIGHT (SUPER FIX) ---
 export function scrollToRow(rowNumber) {
-    // 1. Pastikan tab "Tenant Data" aktif. Panggil navigasi global Anda.
-    const tenantTabBtn = document.querySelector('[onclick*="switchTab(\\\'tenant\\\')"]') || 
-                         document.querySelector('[onclick*="switchTab(\'tenant\')"]') || 
-                         document.getElementById('tab-tenant'); 
-                         
-    if (tenantTabBtn) {
-        tenantTabBtn.click();
-    } else if (typeof window.switchTab === 'function') {
-        window.switchTab('tenant');
+    // 1. TUTUP MODAL VISUALIZER (PENTING!)
+    // Karena tabel Validation Log ada di dalam Modal, jika modal tidak ditutup, 
+    // user tidak akan melihat layar di belakangnya sedang men-scroll.
+    const modal = document.getElementById('vizModal');
+    if (modal) {
+        modal.classList.add('hidden');
     }
 
-    // 2. Beri jeda agar UI tab selesai transisi
-    setTimeout(() => {
-        if (!appState.currentData) return;
+    // 2. PAKSA PINDAH TAB KE "TENANT DATA"
+    if (typeof window.switchTab === 'function') {
+        window.switchTab('tenant');
+    } else {
+        const tenantTabBtn = document.querySelector('[onclick*="switchTab(\\\'tenant\\\')"]') || 
+                             document.querySelector('[onclick*="switchTab(\'tenant\')"]');
+        if (tenantTabBtn) tenantTabBtn.click();
+    }
 
-        // 3. Reset Filter Jika Sedang Aktif (Penting: agar baris error tidak tersembunyi)
-        const searchInput = document.getElementById('tableSearch');
-        let filterResetted = false;
+    // 3. Jeda untuk membiarkan CSS transisi tab & modal selesai
+    setTimeout(() => {
         
-        if (searchInput && searchInput.value !== "") {
-            searchInput.value = "";
-            filterResetted = true;
+        // --- TARIK DATA LANGSUNG DARI STATE ---
+        const fileName = appState.processedKeys[appState.currentFileIndex];
+        const item = appState.processed[fileName];
+        
+        if (!item || !item.belowData) {
+            showToast("Gagal memuat data sumber.", "error");
+            return;
         }
+
+        // Tembak langsung data aslinya untuk menghindari appState.currentData yang undefined
+        appState.currentData = item.belowData;
+
+        // 4. RESET SEMUA FILTER PENCARIAN
+        const searchInput = document.getElementById('tableSearch');
+        if (searchInput) searchInput.value = "";
         
         if (appState.currentLenFilter !== 'all') {
             appState.currentLenFilter = 'all';
-            // Update UI tombol filter kembali ke state 'all'
             ['all', '17', '21', '26', '30'].forEach(l => {
                 const btn = document.getElementById(`len-btn-${l}`);
-                if(btn) {
-                    btn.className = l === 'all' 
-                        ? "px-3 py-1.5 text-xs font-bold rounded-lg bg-mitratel-red text-white transition shadow-sm whitespace-nowrap"
-                        : "px-3 py-1.5 text-xs font-bold rounded-lg bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 transition whitespace-nowrap";
-                }
+                if(btn) btn.className = l === 'all' 
+                    ? "px-3 py-1.5 text-xs font-bold rounded-lg bg-mitratel-red text-white transition shadow-sm whitespace-nowrap"
+                    : "px-3 py-1.5 text-xs font-bold rounded-lg bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:hover:bg-gray-700 transition whitespace-nowrap";
             });
-            filterResetted = true;
         }
         
-        // Render ulang tabel utuh tanpa filter
-        if (filterResetted) {
-            filterTable(false); 
-        }
+        // Memaksa tabel render ulang tanpa filter
+        filterTable(true); 
 
-        // 4. Cari posisi baris di keseluruhan data (currentData)
-        // Kita bandingkan dengan `_rowIndex` (jika ada) ATAU fallback ke urutan array + 2
-        const dataIndex = appState.currentData.findIndex((r, idx) => {
+        // 5. CARI INDEX BARIS TERSEBUT
+        const dataIndex = appState.filteredData.findIndex((r, idx) => {
              const currentRowNum = r._rowIndex || (idx + 2);
              return currentRowNum === rowNumber;
         });
 
         if (dataIndex !== -1) {
-            // 5. Pindah Pagination ke halaman tempat baris tersebut berada
+            // 6. PINDAH HALAMAN PAGINATION
             const targetPage = Math.ceil((dataIndex + 1) / appState.rowsPerPage);
             if (appState.currentPage !== targetPage) {
                 appState.currentPage = targetPage;
@@ -568,27 +576,25 @@ export function scrollToRow(rowNumber) {
                 updatePaginationInfo();
             }
 
-            // 6. Jalankan animasi Scroll & Blink
+            // 7. JALANKAN ANIMASI SCROLL
             setTimeout(() => {
                 const targetRow = document.getElementById(`tenant-row-${rowNumber}`);
                 if (targetRow) {
                     targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    
                     targetRow.classList.add('bg-yellow-200', 'dark:bg-yellow-900/50', 'transition-all', 'duration-500', 'ring-2', 'ring-yellow-400');
                     
                     setTimeout(() => {
                         targetRow.classList.remove('bg-yellow-200', 'dark:bg-yellow-900/50', 'ring-2', 'ring-yellow-400');
                     }, 3000);
                 } else {
-                    console.warn(`DOM Element tr#tenant-row-${rowNumber} tidak ter-render.`);
-                    showToast(`Baris ${rowNumber} tidak ditemukan di tampilan.`, 'warning');
+                    showToast(`Baris ${rowNumber} tidak ter-render di layar.`, 'warning');
                 }
-            }, 150); // Jeda render
+            }, 200);
 
         } else {
-            showToast(`Data baris ${rowNumber} tidak ada di memori.`, 'error');
+            showToast(`Data baris ${rowNumber} tidak ditemukan dalam file ini.`, 'error');
         }
-    }, 150);
+    }, 400); // Waktu 400ms cukup untuk memberi nafas pada browser memproses DOM
 }
 
 window.appActions = window.appActions || {};
