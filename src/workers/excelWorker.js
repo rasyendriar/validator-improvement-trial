@@ -1,12 +1,15 @@
 /**
  * src/workers/excelWorker.js
  * Web Worker untuk memproses file Excel di background thread.
- * Update Phase 3: Menggunakan ES Module & Dynamic Rule Engine.
+ * Menggunakan Classic Script dengan importScripts untuk kompatibilitas GitHub Pages.
  */
 
-// Karena ini sekarang adalah Module Worker, kita import SheetJS versi .mjs
-import * as XLSX from 'https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.mjs';
-import { runRowRules, runPostProcessRules } from '../rules/coreRules.js';
+// 1. Import SheetJS
+importScripts('https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js');
+
+// 2. Import Rule Engine dari file eksternal
+// Menggunakan trik sederhana untuk memuat file JS lokal ke dalam global scope worker
+importScripts('../rules/coreRules.js');
 
 // --- Helper Functions ---
 const excelRow = (i) => i + 2;
@@ -32,7 +35,7 @@ self.onmessage = function(e) {
     const { fileBuffer, fileName, anchorPid, workCenterMap } = e.data;
     
     try {
-        // 1. Parsing Workbook
+        // Parsing Workbook
         const workbook = XLSX.read(fileBuffer, { type: 'array' });
         
         if (!workbook.SheetNames.includes('below_ring')) {
@@ -67,7 +70,7 @@ self.onmessage = function(e) {
             });
         }
 
-        // 2. Persiapkan Konteks (State) untuk Rule Engine
+        // Persiapkan Konteks untuk Rule Engine
         const context = {
             anchorPid,
             workCenterMap,
@@ -82,7 +85,7 @@ self.onmessage = function(e) {
             warnings: []
         };
 
-        // 3. Eksekusi Validasi Baris demi Baris melalui Rule Engine (Sangat Bersih!)
+        // Eksekusi Validasi via fungsi global dari coreRules.js
         belowData.forEach((r, idx) => {
             r._rowIndex = idx + 2; 
             const s = String(r.STRNO || "");
@@ -90,18 +93,17 @@ self.onmessage = function(e) {
             r.STRNO_LENGTH = len;
             if (len === 17) r.PLTXT = s; 
 
-            runRowRules(r, context);
+            // Panggil fungsi engine dari coreRules.js (sudah masuk ke self/global worker)
+            if(self.runRowRules) self.runRowRules(r, context);
         });
 
-        // 4. Eksekusi Validasi Post-Process (Antar Baris / Global)
-        runPostProcessRules(belowData, displayData, context);
+        if(self.runPostProcessRules) self.runPostProcessRules(belowData, displayData, context);
 
-        // 5. Tentukan Status Akhir
+        // Tentukan Status Akhir
         let statusStr = "PASS";
         if (context.errors.length > 0) statusStr = "FAIL";
         else if (context.warnings.length > 0) statusStr = "WARNING";
 
-        // Generate SAP TXT Data
         const exportBelowData = belowData.map(r => {
             const { STRNO_LENGTH, _rowIndex, ...rest } = r;
             return rest;
@@ -110,7 +112,6 @@ self.onmessage = function(e) {
         const headerOrder = ['STRNO', ...allKeys.filter(k => k!=='STRNO')]; 
         const sapTxt = buildSapTxtFromRows(exportBelowData, headerOrder);
 
-        // Kembalikan Hasil
         postMessage({
             success: true,
             fileName: fileName,
