@@ -22,7 +22,7 @@ import { initBatcher, viewMissingFiles, sendBatchToValidator } from './services/
 import { initConverter } from './services/converterService.js';
 
 // Import Exports
-import { downloadSapTxt, downloadSapMerge, downloadSapBatch, downloadBatch, downloadReport, downloadManifest } from './utils/fileExport.js';
+import { downloadSapTxt, downloadSapMerge, downloadSapBatch, downloadBatch, downloadReport, downloadManifest, downloadSingleExcel } from './utils/fileExport.js';
 
 // --- INISIALISASI ---
 document.addEventListener('DOMContentLoaded', () => {
@@ -137,6 +137,9 @@ function exposeAppActions() {
     window.appActions.switchTabDisplay = () => switchTab('display');
     window.appActions.switchTabData = () => switchTab('data', renderDataCallback, updatePaginationInfo);
     window.appActions.switchTabErrors = () => switchTab('errors');
+    
+    // ... (Cari fungsi exposeAppActions(), tambahkan sebaris kode ini di dalamnya)
+    window.appActions.downloadSingleExcel = downloadSingleExcel;
 
     // Hubungkan tombol HTML static ke fungsi global
     const binds = [
@@ -316,3 +319,4 @@ function setupKeyboardShortcuts() {
         }
     });
 }
+
