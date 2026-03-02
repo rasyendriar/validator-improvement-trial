@@ -6,10 +6,21 @@
  * - Rendering Tabel Data Tenant (beserta Pagination)
  * - Rendering Tabel Error/Warning Log
  * - FITUR BARU: Edit Mode & Smart Group Drag-and-Drop Reordering
+ * - IMPROVEMENT PHASE 2: Integrasi EventBus & Smart Error Highlight (Click-to-Row)
  */
 
 import { appState } from '../state/store.js';
 import { showToast } from './modals.js';
+import { appEventBus } from '../utils/eventBus.js'; // IMPORT EVENT BUS BARU
+
+// --- EVENT SUBSCRIBER (PHASE 2) ---
+// Mendengarkan event revalidasi agar tabel otomatis merender ulang tanpa circular dependency
+appEventBus.on('DATA_REVALIDATED', (updatedItem) => {
+    const combinedErrors = [...updatedItem.errors, ...(updatedItem.warnings || [])];
+    renderErrorTable(combinedErrors);
+    renderDisplayRingTable(updatedItem.displayData);
+    filterTable(true); // Paksa render ulang data tenant
+});
 
 // --- STATE EDIT MODE ---
 export let isEditMode = false;
@@ -241,9 +252,18 @@ export function renderErrorTable(errors) {
         const rowClass = isWarning ? "hover:bg-orange-50 dark:hover:bg-orange-900/10" : "hover:bg-red-50 dark:hover:bg-red-900/10";
         const textClass = isWarning ? "text-orange-600 dark:text-orange-400" : "text-red-600 dark:text-red-400";
 
+        // --- SMART HIGHLIGHT: Modifikasi Row Menjadi Tombol ---
+        let rowDisplay = err.Row;
+        // Cek apakah err.Row berupa baris angka Excel
+        let isClickableRow = typeof err.Row === 'number' || (typeof err.Row === 'string' && !isNaN(parseInt(err.Row)));
+        
+        if (isClickableRow) {
+            rowDisplay = `<button onclick="window.appActions.scrollToRow(${err.Row})" class="text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 underline font-medium cursor-pointer transition-colors" title="Klik untuk melihat baris ini di Tenant Data">Baris ${err.Row}</button>`;
+        }
+
         tr.className = `${rowClass} transition border-b border-gray-100 dark:border-gray-800`;
         tr.innerHTML = `
-            <td class="px-6 py-3 text-sm font-mono text-slate-500 dark:text-gray-400">${err.Row}</td>
+            <td class="px-6 py-3 text-sm font-mono text-slate-500 dark:text-gray-400">${rowDisplay}</td>
             <td class="px-6 py-3 text-sm font-bold ${textClass}">${err.Rule}</td>
             <td class="px-6 py-3 text-sm text-slate-700 dark:text-gray-300">${err.Message}</td>
         `;
@@ -366,6 +386,13 @@ export function renderTablePage() {
 
     pageData.forEach((row, idx) => {
         const tr = document.createElement('tr');
+        
+        // --- INJEKSI ID UNTUK SCROLLING (PHASE 2) ---
+        // Kita menggunakan _rowIndex yang sudah digenerate dari excelWorker saat validasi awal
+        if (row._rowIndex) {
+            tr.id = `tenant-row-${row._rowIndex}`;
+        }
+
         const pltxt = String(row.PLTXT || "");
         const isMatch = appState.targetPID && pltxt.includes(appState.targetPID);
         
@@ -498,3 +525,64 @@ export function initTableEvents() {
     const btnNext = document.getElementById('btnNext');
     if(btnNext) btnNext.addEventListener('click', () => changePage(1));
 }
+
+// --- FUNGSI SCROLL SMART HIGHLIGHT (PHASE 2) ---
+export function scrollToRow(rowNumber) {
+    // 1. Pindah tab ke Tenant Data secara otomatis
+    const tenantTabBtn = document.querySelector('[onclick*="switchTab(\\\'tenant\\\')"]') || 
+                         document.querySelector('[onclick*="switchTab(\'tenant\')"]') || 
+                         document.getElementById('tab-tenant'); // Sesuaikan selector tab HTML Anda
+                         
+    if (tenantTabBtn) {
+        tenantTabBtn.click();
+    } else if (typeof window.switchTab === 'function') {
+        window.switchTab('tenant');
+    }
+
+    // Beri jeda sejenak agar tab selesai render / transisi CSS
+    setTimeout(() => {
+        if (!appState.filteredData) return;
+
+        // 2. Cari di mana posisi data baris tersebut berada (Index-nya)
+        const dataIndex = appState.filteredData.findIndex(r => r._rowIndex === rowNumber);
+
+        if (dataIndex !== -1) {
+            // 3. Otomatis Pindah Pagination (Jika barisnya berada di page 2,3, dst)
+            const targetPage = Math.ceil((dataIndex + 1) / appState.rowsPerPage);
+            if (appState.currentPage !== targetPage) {
+                appState.currentPage = targetPage;
+                renderTablePage();
+                updatePaginationInfo();
+            }
+
+            // 4. Lakukan animasi scroll & blink ke elemen baris tersebut
+            setTimeout(() => {
+                const targetRow = document.getElementById(`tenant-row-${rowNumber}`);
+                if (targetRow) {
+                    targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    // Tambahkan class blink (kuning/merah)
+                    targetRow.classList.add('bg-yellow-200', 'dark:bg-yellow-900/50', 'transition-all', 'duration-500');
+                    // Bersihkan class setelah 3 detik
+                    setTimeout(() => {
+                        targetRow.classList.remove('bg-yellow-200', 'dark:bg-yellow-900/50');
+                    }, 3000);
+                }
+            }, 100); 
+
+        } else {
+            // Fallback: Jika baris disembunyikan oleh Filter, reset filter dulu lalu coba lagi
+            const searchInput = document.getElementById('tableSearch');
+            if (searchInput && searchInput.value !== "") {
+                searchInput.value = "";
+                filterTable(true);
+                setTimeout(() => scrollToRow(rowNumber), 150);
+            } else {
+                showToast(`Baris ${rowNumber} tidak ditemukan.`, 'warning');
+            }
+        }
+    }, 150);
+}
+
+// Expose fungsi ke global object agar bisa dipanggil dari atribut HTML onclick=""
+window.appActions = window.appActions || {};
+window.appActions.scrollToRow = scrollToRow;
