@@ -1,13 +1,14 @@
 /**
  * src/utils/fileExport.js
- * Menangani semua logika pengunduhan file (Excel & TXT) dari tab Validator dan Batcher.
+ * Menangani logika pengunduhan file (Excel & TXT)
+ * Update Phase 1: Generate Workbook (XLSX) On-The-Fly untuk mencegah Memory Leak.
  */
 
 import { appState, batcherState } from '../state/store.js';
 import { showToast } from '../ui/modals.js';
 import { GameSystem } from '../state/gamification.js';
 
-// --- Helper Internal untuk Memicu Download ---
+// --- Helper Internal ---
 function triggerDownload(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -17,6 +18,40 @@ function triggerDownload(blob, filename) {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+}
+
+// Fungsi BARU: Membangun kembali (Generate) objek Workbook dari JSON mentah.
+export function generateWorkbook(item) {
+    const newWb = window.XLSX.utils.book_new();
+    
+    // Siapkan belowData (Buang properti temporary seperti _rowIndex & STRNO_LENGTH)
+    const exportBelowData = item.belowData.map(r => {
+        const { STRNO_LENGTH, _rowIndex, ...rest } = r;
+        return rest;
+    });
+
+    const allKeys = Object.keys(exportBelowData[0] || {});
+    const headerOrder = ['STRNO', ...allKeys.filter(k => k!=='STRNO')]; 
+
+    const wsBelow = window.XLSX.utils.json_to_sheet(exportBelowData, { header: headerOrder });
+    window.XLSX.utils.book_append_sheet(newWb, wsBelow, "below_ring");
+
+    if (item.displayData && item.displayData.length) {
+        const wsDisplay = window.XLSX.utils.json_to_sheet(item.displayData);
+        window.XLSX.utils.book_append_sheet(newWb, wsDisplay, "display_ring");
+    }
+
+    if (item.errors && item.errors.length > 0) {
+        const wsErr = window.XLSX.utils.json_to_sheet(item.errors);
+        window.XLSX.utils.book_append_sheet(newWb, wsErr, "ERROR_LOG");
+    }
+    
+    if (item.warnings && item.warnings.length > 0) {
+         const wsWarn = window.XLSX.utils.json_to_sheet(item.warnings);
+         window.XLSX.utils.book_append_sheet(newWb, wsWarn, "WARNING_LOG");
+    }
+
+    return newWb;
 }
 
 // --- FUNGSI EXPORT SAP TXT ---
@@ -40,16 +75,13 @@ export function downloadSapMerge() {
     let combinedTxt = "";
     let count = 0;
     
-    // Merge hanya mengambil data dari baris ke-2 (menghilangkan header) untuk file ke-2 dst.
     pKeys.forEach((key, idx) => {
         const item = appState.processed[key];
         if (item && item.status === 'PASS' && item.sapTxt) {
             const lines = item.sapTxt.split('\r\n');
             if (count === 0) {
-                // File pertama: Ambil semua termasuk header
                 combinedTxt += lines.join('\r\n') + '\r\n';
             } else {
-                // File berikutnya: Ambil data mulai baris ke-2 (index 1)
                 if (lines.length > 1) {
                     combinedTxt += lines.slice(1).join('\r\n') + '\r\n';
                 }
@@ -83,7 +115,6 @@ export function downloadSapBatch(mode) {
         if (mode === 'all' || (mode === 'pass' && item.status === 'PASS')) {
             const blob = new Blob([item.sapTxt], { type: "text/plain" });
             const outName = key.replace(/\.[^/.]+$/, "") + "_SAP.txt";
-            // Beri jeda sedikit agar browser tidak memblokir multiple download
             setTimeout(() => triggerDownload(blob, outName), count * 300);
             count++;
         }
@@ -93,7 +124,20 @@ export function downloadSapBatch(mode) {
     else showToast("No matching files found to download", "error");
 }
 
-// --- FUNGSI EXPORT EXCEL VALIDATOR (BATCH DOWNLOAD) ---
+// --- FUNGSI EXPORT EXCEL VALIDATOR ---
+
+export function downloadSingleExcel(fileName) {
+    const item = appState.processed[fileName];
+    if (!item) return showToast("File tidak ditemukan", "error");
+
+    showToast("Generating Excel file...", "info");
+    setTimeout(() => {
+        const wb = generateWorkbook(item);
+        const wbOut = window.XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        const blob = new Blob([wbOut], { type: "application/octet-stream" });
+        triggerDownload(blob, `VALIDATED_v4_${fileName}`);
+    }, 100); 
+}
 
 export function downloadBatch(mode) {
     const pKeys = appState.processedKeys;
@@ -102,7 +146,7 @@ export function downloadBatch(mode) {
     let count = 0;
     pKeys.forEach(key => {
         const item = appState.processed[key];
-        if(!item || !item.wb) return;
+        if(!item) return;
 
         let shouldDownload = false;
         if(mode === 'all') shouldDownload = true;
@@ -110,7 +154,8 @@ export function downloadBatch(mode) {
         else if(mode === 'fail' && item.status === 'FAIL') shouldDownload = true;
 
         if (shouldDownload) {
-            const wbOut = window.XLSX.write(item.wb, { bookType: 'xlsx', type: 'array' });
+            const wb = generateWorkbook(item); // Generate on the fly
+            const wbOut = window.XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
             const blob = new Blob([wbOut], { type: "application/octet-stream" });
             setTimeout(() => triggerDownload(blob, `VALIDATED_v4_${key}`), count * 300);
             count++;
@@ -128,21 +173,12 @@ export function downloadReport() {
     const reportData = [];
     pKeys.forEach((key, idx) => {
         const item = appState.processed[key];
-        
-        // Setup Cek Asset
         const cekAsset = item.status === 'PASS' ? "Done Upload SAP" : "NY OK";
-        
-        // Setup Verify Status
         const verifyStatus = GameSystem.isVerified(item.pid) ? "Verified" : "Unverified";
         
-        // Setup Remarks (Concatenate error and warning messages)
         let remarksArr = [];
-        if (item.errors && item.errors.length > 0) {
-            item.errors.forEach(e => remarksArr.push(`[${e.Rule}] ${e.Message}`));
-        }
-        if (item.warnings && item.warnings.length > 0) {
-            item.warnings.forEach(w => remarksArr.push(`[${w.Rule}] ${w.Message}`));
-        }
+        if (item.errors && item.errors.length > 0) item.errors.forEach(e => remarksArr.push(`[${e.Rule}] ${e.Message}`));
+        if (item.warnings && item.warnings.length > 0) item.warnings.forEach(w => remarksArr.push(`[${w.Rule}] ${w.Message}`));
         const remarks = remarksArr.length > 0 ? remarksArr.join(" | ") : "OK";
 
         reportData.push({
@@ -168,8 +204,6 @@ export function downloadReport() {
     triggerDownload(blob, "Validation_Summary_Report.xlsx");
 }
 
-// --- FUNGSI EXPORT BATCHER MANIFEST ---
-
 export function downloadManifest() {
     if (batcherState.targetFiles.size === 0 && batcherState.folderMap.size === 0) {
         showToast("No data to report.", "error");
@@ -177,8 +211,6 @@ export function downloadManifest() {
     }
 
     const wb = window.XLSX.utils.book_new();
-    
-    // 1. Matched Files Sheet
     const matchedData = [];
     batcherState.batches.forEach((batch, bIdx) => {
         batch.forEach(f => {
@@ -195,7 +227,6 @@ export function downloadManifest() {
         window.XLSX.utils.book_append_sheet(wb, wsMatched, "Matched_Files");
     }
 
-    // 2. Missing Files Sheet
     if(batcherState.missingFiles && batcherState.missingFiles.length > 0) {
         const missingData = batcherState.missingFiles.map(name => ({ "Target File / PID": name, "Status": "MISSING" }));
         const wsMissing = window.XLSX.utils.json_to_sheet(missingData);
