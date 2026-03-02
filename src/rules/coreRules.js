@@ -1,15 +1,13 @@
 /**
  * src/rules/coreRules.js
- * Kumpulan fungsi validasi (Rule Engine) yang dipisahkan dari logika utama.
- * Arsitektur ini memungkinkan penambahan aturan baru (R21, R22, dst) 
- * tanpa perlu membongkar atau merusak file validator utama.
+ * Kumpulan fungsi validasi (Rule Engine).
+ * Dimodifikasi agar kompatibel dipanggil via `importScripts` di Worker,
+ * sekaligus bisa di-import biasa di validatorService.js.
  */
 
-// ==========================================
-// KUMPULAN FUNGSI ATURAN (RULES)
-// ==========================================
+const RuleEngine = {};
 
-export const validateR5Length = (row) => {
+RuleEngine.validateR5Length = (row) => {
     const s = String(row.STRNO || "").trim();
     const len = row.STRNO_LENGTH;
     const allowed = [17, 21, 26, 30];
@@ -20,7 +18,7 @@ export const validateR5Length = (row) => {
     return { isValid: true };
 };
 
-export const validateR7Abckz = (row) => {
+RuleEngine.validateR7Abckz = (row) => {
     const s = String(row.STRNO || "").trim();
     const len = row.STRNO_LENGTH;
     const abckz = String(row.ABCKZ || "").trim().toUpperCase();
@@ -42,7 +40,7 @@ export const validateR7Abckz = (row) => {
     return { isValid: true };
 };
 
-export const validateR9Duplicate = (row, context) => {
+RuleEngine.validateR9Duplicate = (row, context) => {
     const s = String(row.STRNO || "").trim();
     if (context.seenStrno.has(s)) {
         context.duplicates.add(s);
@@ -52,7 +50,7 @@ export const validateR9Duplicate = (row, context) => {
     return { isValid: true };
 };
 
-export const validateR12WorkCenter = (row, context) => {
+RuleEngine.validateR12WorkCenter = (row, context) => {
     const workCenterMap = context.workCenterMap;
     if (!workCenterMap || Object.keys(workCenterMap).length === 0) return { isValid: true };
     
@@ -68,8 +66,7 @@ export const validateR12WorkCenter = (row, context) => {
     return { isValid: true };
 };
 
-// Aturan yang mengumpulkan data untuk diproses belakangan (Post-Process)
-export const collectR16AndR18Data = (row, context) => {
+RuleEngine.collectR16AndR18Data = (row, context) => {
     const strno = String(row.STRNO || "").trim();
     const pltxt = String(row.PLTXT || "").trim();
     const len = row.STRNO_LENGTH;
@@ -77,7 +74,6 @@ export const collectR16AndR18Data = (row, context) => {
     if (len === 30) {
         const segId = strno.substring(0, 26);
         
-        // Setup Segment Map untuk R14 & R15
         if (!context.segmentMap.hasOwnProperty(segId)) {
             context.segmentMap[segId] = false;
             context.segmentOrder.push(segId);
@@ -86,7 +82,6 @@ export const collectR16AndR18Data = (row, context) => {
             context.segmentMap[segId] = true;
         }
 
-        // Kumpulkan data urutan untuk R16 Anti Split
         if (!context.r16Segments[segId]) context.r16Segments[segId] = { sequence: [] };
         const segState = context.r16Segments[segId];
         const normPid = pltxt ? pltxt : "EMPTY_CORE"; 
@@ -111,7 +106,6 @@ export const collectR16AndR18Data = (row, context) => {
             segState.sequence.push({ pid: normPid, row: row._rowIndex });
         }
 
-        // Kumpulkan data Okupansi untuk R18
         if (pltxt && !pltxt.toUpperCase().includes("KABEL")) {
             const basePid = pltxt.replace(/\[R\]|\(R\)/gi, '').trim().toUpperCase();
             if (!context.r18Occupancy[segId]) context.r18Occupancy[segId] = {};
@@ -121,7 +115,7 @@ export const collectR16AndR18Data = (row, context) => {
     return { isValid: true };
 };
 
-export const collectR17Data = (row, context) => {
+RuleEngine.collectR17Data = (row, context) => {
     const strno = String(row.STRNO || "").trim();
     if (row.STRNO_LENGTH === 26) {
         const match = strno.match(/^(.+?)([A-Z]+)(\d+)$/); 
@@ -135,45 +129,31 @@ export const collectR17Data = (row, context) => {
     return { isValid: true };
 };
 
-
 // ==========================================
-// ENGINE UTAMA UNTUK MENJALANKAN ATURAN
+// ENGINE UTAMA 
 // ==========================================
 
-/**
- * Menjalankan semua aturan yang didefinisikan terhadap satu baris data.
- */
-export function runRowRules(row, context) {
-    // Daftarkan semua fungsi aturan yang ingin dieksekusi untuk setiap baris.
-    // Jika ingin menambah aturan baru, cukup tambahkan fungsinya ke array ini.
+RuleEngine.runRowRules = function(row, context) {
     const rulesToRun = [
-        validateR5Length,
-        validateR7Abckz,
-        validateR9Duplicate,
-        validateR12WorkCenter,
-        collectR16AndR18Data,
-        collectR17Data
+        RuleEngine.validateR5Length,
+        RuleEngine.validateR7Abckz,
+        RuleEngine.validateR9Duplicate,
+        RuleEngine.validateR12WorkCenter,
+        RuleEngine.collectR16AndR18Data,
+        RuleEngine.collectR17Data
     ];
 
     for (const ruleFunc of rulesToRun) {
         const result = ruleFunc(row, context);
         if (!result.isValid) {
             const report = { Rule: result.Rule, Row: row._rowIndex, Message: result.Message };
-            if (result.isError) {
-                context.errors.push(report);
-            } else {
-                context.warnings.push(report);
-            }
+            if (result.isError) context.errors.push(report);
+            else context.warnings.push(report);
         }
     }
-}
+};
 
-/**
- * Menjalankan aturan-aturan yang memerlukan pengecekan data secara keseluruhan (Post-Process).
- */
-export function runPostProcessRules(belowData, displayData, context) {
-    
-    // Evaluasi R17 (Sequential)
+RuleEngine.runPostProcessRules = function(belowData, displayData, context) {
     Object.keys(context.r17MaterialGroups).forEach(key => {
         const items = context.r17MaterialGroups[key].sort((a,b) => a.num - b.num);
         if (items.length > 0) {
@@ -189,7 +169,6 @@ export function runPostProcessRules(belowData, displayData, context) {
         }
     });
 
-    // Evaluasi R18 (Occupancy)
     Object.keys(context.r18Occupancy).forEach(segId => {
         const pidCounts = context.r18Occupancy[segId];
         Object.keys(pidCounts).forEach(pid => {
@@ -199,7 +178,6 @@ export function runPostProcessRules(belowData, displayData, context) {
         });
     });
 
-    // Evaluasi R19 (Connectivity)
     const segments = belowData.filter(r => r.STRNO_LENGTH === 21);
     for(let k=0; k < segments.length - 1; k++) {
         const curr = segments[k];
@@ -220,7 +198,6 @@ export function runPostProcessRules(belowData, displayData, context) {
         }
     }
 
-    // Evaluasi R14 & R15 (Anchor PID Checks)
     if (context.segmentOrder.length > 0) {
         const firstSegId = context.segmentOrder[0];
         if (context.segmentMap[firstSegId] === false) {
@@ -234,7 +211,6 @@ export function runPostProcessRules(belowData, displayData, context) {
         }
     });
 
-    // Evaluasi R13 (Anchor PID Global Missing)
     let anchorPidFound = false;
     for (const r of belowData) {
         if (r.STRNO_LENGTH === 30 && String(r.PLTXT || "").toUpperCase().trim().includes(context.anchorPid)) {
@@ -246,7 +222,6 @@ export function runPostProcessRules(belowData, displayData, context) {
         context.errors.push({ Rule: "R13_ANCHOR_PID_MISSING", Row: "GLOBAL", Message: `Anchor PID '${context.anchorPid}' (dari Nama File) tidak ditemukan sama sekali pada data Core.` });
     }
 
-    // Evaluasi Aturan Display Ring (R10, R11, R20)
     if (displayData && displayData.length) {
         let lastPidCounts = null; 
         let lastCableId = null;
@@ -254,8 +229,6 @@ export function runPostProcessRules(belowData, displayData, context) {
         
         displayData.forEach((r, i) => {
             const actualRow = i + 2;
-            
-            // R10: Cross Check
             colsCheck.forEach(col => {
                 if (r[col]) { 
                     const val = String(r[col] || "").trim();
@@ -265,7 +238,6 @@ export function runPostProcessRules(belowData, displayData, context) {
                 }
             });
 
-            // R11: PID Consistency
             const cableId = r['LINK_DESCRIPTION'];
             if (cableId) {
                 const cores = belowData.filter(b => {
@@ -298,7 +270,6 @@ export function runPostProcessRules(belowData, displayData, context) {
             }
         });
 
-        // R20: Display Chain
         for (let i = 1; i < displayData.length; i++) {
             const prevTo = String(displayData[i - 1]['LINK_TO_FUNCTIONAL_LOCATION_DESC'] || "").trim();
             const currFrom = String(displayData[i]['LINK_FROM_FUNCTIONAL_LOCATION_DESC'] || "").trim();
@@ -307,4 +278,13 @@ export function runPostProcessRules(belowData, displayData, context) {
             }
         }
     }
+};
+
+// Ekspor untuk digunakan di validatorService.js (Main Thread)
+export const { runRowRules, runPostProcessRules } = RuleEngine;
+
+// Tempelkan ke global jika dieksekusi di Worker via importScripts
+if (typeof self !== 'undefined') {
+    self.runRowRules = RuleEngine.runRowRules;
+    self.runPostProcessRules = RuleEngine.runPostProcessRules;
 }
