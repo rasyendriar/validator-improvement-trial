@@ -1,15 +1,16 @@
 /**
  * src/services/validatorService.js
- * Menangani antrean file, proses validasi, dan pengecekan Rules (R5-R20).
- * Update Phase 2: High-Performance Worker Pool & Integrasi EventBus.
+ * Menangani antrean file, proses validasi, dan pengecekan Rules.
+ * Update Phase 3: Integrasi Dynamic Rule Engine & Module Worker.
  */
 
 import { appState, recalculateStats, clearValidatorState } from '../state/store.js';
 import { GameSystem } from '../state/gamification.js';
-import { extractAnchorPid, isEmpty, excelRow, buildSapTxtFromRows } from '../utils/helpers.js';
+import { extractAnchorPid, excelRow, buildSapTxtFromRows } from '../utils/helpers.js';
 import { showToast } from '../ui/modals.js';
 import { filterQueueTable } from '../ui/tables.js';
-import { appEventBus } from '../utils/eventBus.js'; // IMPORT EVENT BUS BARU
+import { appEventBus } from '../utils/eventBus.js'; 
+import { runRowRules, runPostProcessRules } from '../rules/coreRules.js'; // IMPORT RULE ENGINE
 
 // --- UI UPDATERS (Khusus Validator) ---
 
@@ -157,7 +158,7 @@ export function clearValidatorQueue() {
     if(fileElem) fileElem.value = '';
 }
 
-// 🚀 FUNGSI BATCH UTAMA DENGAN WORKER POOL (ENTERPRISE GRADE)
+// 🚀 FUNGSI BATCH UTAMA DENGAN WORKER POOL
 export async function startBatchValidation() {
     const btn = document.getElementById('btnStartValidation');
     if (!btn) return;
@@ -172,17 +173,15 @@ export async function startBatchValidation() {
     appState.stats.warning = 0;
     updateDashboardUI();
 
-    // 1. Tentukan Concurrency Limit (Maksimal 6 worker)
     const CONCURRENCY_LIMIT = Math.min(navigator.hardwareConcurrency || 4, 6);
     const workers = [];
     const pendingResolvers = new Map(); 
 
-    // 2. Inisialisasi Worker Pool 
+    // PHASE 3: Inisialisasi dengan { type: 'module' }
     for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
         const workerUrl = new URL('../workers/excelWorker.js', import.meta.url);
-        const w = new Worker(workerUrl);
+        const w = new Worker(workerUrl, { type: 'module' }); 
         
-        // Listener global untuk worker ini
         w.onmessage = (e) => {
             const data = e.data;
             if (data && data.fileName && pendingResolvers.has(data.fileName)) {
@@ -194,7 +193,6 @@ export async function startBatchValidation() {
         workers.push(w);
     }
 
-    // 3. Sistem Antrean (Queue System)
     let currentIndex = 0;
     const queue = [...appState.queue];
     
@@ -209,16 +207,13 @@ export async function startBatchValidation() {
         }
     };
 
-    // 4. Jalankan X buah "Thread" secara bersamaan
     const threads = [];
     for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
         threads.push(processNextInPool(i));
     }
 
-    // 5. Tunggu semua thread selesai menghabiskan antrean
     await Promise.all(threads);
 
-    // 6. Cleanup: Matikan semua worker untuk membebaskan RAM
     workers.forEach(w => w.terminate());
     pendingResolvers.clear();
     
@@ -258,7 +253,6 @@ async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
             });
         }
 
-        // Tunggu hasil dari Worker
         const workerResult = await new Promise((resolve) => {
             pendingResolvers.set(file.name, resolve);
             
@@ -274,7 +268,6 @@ async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
             throw new Error(workerResult.error);
         }
 
-        // --- UPDATE STATE & UI ---
         appState.stats.total++;
         if(workerResult.status === "PASS") {
             appState.stats.pass++;
@@ -332,8 +325,7 @@ async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
     }
 }
 
-// --- LOGIKA VALIDASI MURNI (RULES R5 - R20) ---
-// Digunakan khusus untuk Re-Validate di dalam tab Edit (Visualizer).
+// --- LOGIKA RE-VALIDASI (SYNCHRONOUS MENGGUNAKAN RULE ENGINE) ---
 
 async function executeValidation(fileName, anchorPid, belowData, displayData, rowId, isRevalidation = false) {
     const row = document.getElementById(rowId);
@@ -349,255 +341,44 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
     }
 
     try {
+        const workCenterMapObj = {};
+        if (appState.workCenterData) {
+            appState.workCenterData.forEach((val, key) => {
+                workCenterMapObj[key] = val;
+            });
+        }
+
+        // Persiapkan Konteks State (Sama seperti Worker)
+        const context = {
+            anchorPid,
+            workCenterMap: workCenterMapObj,
+            seenStrno: new Set(),
+            duplicates: new Set(),
+            segmentMap: {},
+            segmentOrder: [],
+            r16Segments: {},
+            r17MaterialGroups: {},
+            r18Occupancy: {},
+            errors: [],
+            warnings: []
+        };
+
+        // Eksekusi Logika lewat Engine
         belowData.forEach((r, idx) => {
             r._rowIndex = idx + 2; 
             const s = String(r.STRNO || "");
             const len = (s.toLowerCase() === "<na>" || s === "") ? 0 : s.length;
             r.STRNO_LENGTH = len;
             if (len === 17) r.PLTXT = s; 
+
+            runRowRules(r, context);
         });
 
-        const errors = [];
-        const warnings = []; 
-        const rule5_Allowed = [17, 21, 26, 30];
-        const seenStrno = new Set();
-        const duplicates = new Set();
+        runPostProcessRules(belowData, displayData, context);
 
-        const segmentMap = {}; 
-        let segmentOrder = []; 
-
-        const r16Segments = {}; 
-        const r17MaterialGroups = {}; 
-        const r18Occupancy = {}; 
-
-        belowData.forEach((r, i) => {
-            const strno = String(r.STRNO || "").trim();
-            const pltxt = String(r.PLTXT || "").trim();
-            const abckz = String(r.ABCKZ || "").trim().toUpperCase();
-            const len = r.STRNO_LENGTH;
-            
-            // --- CORE RULES (R13, R14, R15, R16, R18) ---
-            if (len === 30) {
-                 const segId = strno.substring(0, 26);
-                 if (!segmentMap.hasOwnProperty(segId)) {
-                     segmentMap[segId] = false;
-                     segmentOrder.push(segId);
-                 }
-                 if (pltxt.toUpperCase().includes(anchorPid)) {
-                     segmentMap[segId] = true;
-                 }
-
-                 if (!r16Segments[segId]) r16Segments[segId] = { sequence: [] };
-                 const segState = r16Segments[segId];
-                 const normPid = pltxt ? pltxt : "EMPTY_CORE"; 
-                 
-                 const seqLen = segState.sequence.length;
-                 const lastPidInSeq = seqLen > 0 ? segState.sequence[seqLen - 1].pid : null;
-
-                 if (normPid !== lastPidInSeq) {
-                     if (normPid !== "EMPTY_CORE") {
-                         const prevIndex = segState.sequence.map(s => s.pid).lastIndexOf(normPid);
-                         if (prevIndex !== -1) {
-                             const gapSlice = segState.sequence.slice(prevIndex + 1);
-                             const hasEmptyCore = gapSlice.some(s => s.pid === "EMPTY_CORE");
-
-                             if (hasEmptyCore) {
-                                 errors.push({ Rule: "R16_ANTI_SPLIT", Row: r._rowIndex, Message: `Error: PID '${pltxt}' terputus oleh core kosong di segmen ${segId}.` });
-                             } else {
-                                 warnings.push({ Rule: "R16_ANTI_SPLIT_WARN", Row: r._rowIndex, Message: `Peringatan: PID '${pltxt}' diselingi oleh project lain di segmen ${segId}.` });
-                             }
-                         }
-                     }
-                     segState.sequence.push({ pid: normPid, row: r._rowIndex });
-                 }
-
-                 if (pltxt && !pltxt.toUpperCase().includes("KABEL")) {
-                     const basePid = pltxt.replace(/\[R\]|\(R\)/gi, '').trim().toUpperCase();
-                     if (!r18Occupancy[segId]) r18Occupancy[segId] = {};
-                     r18Occupancy[segId][basePid] = (r18Occupancy[segId][basePid] || 0) + 1;
-                 }
-            }
-
-            // --- R17 (Sequential) ---
-            if (len === 26) {
-                const match = strno.match(/^(.+?)([A-Z]+)(\d+)$/); 
-                if (match) {
-                    const groupKey = match[1] + match[2]; 
-                    const numVal = parseInt(match[3], 10);
-                    if (!r17MaterialGroups[groupKey]) r17MaterialGroups[groupKey] = [];
-                    r17MaterialGroups[groupKey].push({ num: numVal, row: r._rowIndex, strno: strno });
-                }
-            }
-
-            // --- Basic Rules (R5, R9, R7) ---
-            if (!rule5_Allowed.includes(len)) {
-                errors.push({ Rule: "R5_LENGTH", Row: r._rowIndex, Message: `Panjang ${len} tidak valid. STRNO: ${strno}` });
-            }
-            if (seenStrno.has(strno)) {
-                duplicates.add(strno);
-                errors.push({ Rule: "R9_DUPLICATE", Row: r._rowIndex, Message: `Duplikat STRNO: ${strno}` });
-            } else {
-                seenStrno.add(strno);
-            }
-            
-            const baseMap = { 17: "P", 21: "S", 30: "O" };
-            if (baseMap[len]) {
-                if (abckz !== baseMap[len]) {
-                    errors.push({ Rule: "R7_ABCKZ", Row: r._rowIndex, Message: `Len ${len} harus ABCKZ='${baseMap[len]}', tapi tertulis '${abckz}'` });
-                }
-            } else if (len === 26) {
-                if (strno.length >= 4) {
-                    const code = strno.slice(-4, -2).toUpperCase();
-                    const suffixMap = {"KU": "U", "JC": "R", "OB": "B", "OP": "L", "OC": "M", "OL": "J", "KT": "N", "TP": "H"};
-                    if (suffixMap[code] && abckz !== suffixMap[code]) {
-                        errors.push({ Rule: "R7_ABCKZ", Row: r._rowIndex, Message: `Len 26 (Code ${code}) harus ABCKZ='${suffixMap[code]}', tapi tertulis '${abckz}'` });
-                    }
-                }
-            }
-
-            // --- R12 WORK CENTER ---
-            if (appState.workCenterData && appState.workCenterData.size > 0) {
-                const stort = String(r.STORT || "").trim();
-                const arbpl = String(r.ARBPL || "").trim();
-                if (stort && appState.workCenterData.has(stort)) {
-                    const expectedArbpl = appState.workCenterData.get(stort);
-                    if (arbpl !== expectedArbpl) {
-                        errors.push({ Rule: "R12_WORK_CENTER", Row: r._rowIndex, Message: `STORT '${stort}' requires ARBPL '${expectedArbpl}', but found '${arbpl}'` });
-                    }
-                }
-            }
-        });
-
-        // --- Post-Process Rules ---
-        Object.keys(r17MaterialGroups).forEach(key => {
-            const items = r17MaterialGroups[key].sort((a,b) => a.num - b.num);
-            if (items.length > 0) {
-                if (items[0].num !== 1) {
-                    errors.push({ Rule: "R17_SEQUENTIAL_START", Row: items[0].row, Message: `Urutan aset '${key}' dimulai dari nomor ${items[0].num}, seharusnya 01.` });
-                }
-                for (let k = 1; k < items.length; k++) {
-                    const diff = items[k].num - items[k-1].num;
-                    if (diff > 1) {
-                        errors.push({ Rule: "R17_SEQUENTIAL_GAP", Row: items[k].row, Message: `Lompatan urutan aset '${key}'. Dari ${items[k-1].strno} langsung ke ${items[k].strno} (Gap detected).` });
-                    }
-                }
-            }
-        });
-
-        Object.keys(r18Occupancy).forEach(segId => {
-            const pidCounts = r18Occupancy[segId];
-            Object.keys(pidCounts).forEach(pid => {
-                if (pidCounts[pid] > 4) {
-                    warnings.push({ Rule: "R18_HIGH_OCCUPANCY", Row: `SEGMENT ${segId}`, Message: `PID '${pid}' menggunakan ${pidCounts[pid]} core dalam satu segmen. (Threshold > 4).` });
-                }
-            });
-        });
-
-        const segments = belowData.filter(r => r.STRNO_LENGTH === 21);
-        for(let k=0; k < segments.length - 1; k++) {
-            const curr = segments[k];
-            const next = segments[k+1];
-            const currTxt = String(curr.PLTXT || "").toUpperCase().trim();
-            const nextTxt = String(next.PLTXT || "").toUpperCase().trim();
-            const currParts = currTxt.split('-').map(p => p.trim()).filter(p => p.length > 0);
-            const nextParts = nextTxt.split('-').map(p => p.trim()).filter(p => p.length > 0);
-
-            if (currParts.length > 0 && nextParts.length > 0) {
-                const currEndPoint = currParts[currParts.length - 1];
-                const nextStartPoint = nextParts[0];
-                if (currEndPoint !== nextStartPoint) {
-                    warnings.push({ Rule: "R19_CONNECTIVITY", Row: curr._rowIndex, Message: `Connectivity Terputus: End-Point '${currEndPoint}' pada segmen '${curr.PLTXT}' tidak menyambung dengan Start-Point '${nextStartPoint}' pada segmen '${next.PLTXT}' di baris bawahnya.` });
-                }
-            } else if (currTxt === "" || nextTxt === "") {
-                 warnings.push({ Rule: "R19_CONNECTIVITY", Row: curr._rowIndex, Message: `Connectivity Terputus: Terdapat kolom PLTXT (Segmen) yang kosong.` });
-            }
-        }
-
-        if (segmentOrder.length > 0) {
-            const firstSegId = segmentOrder[0];
-            if (segmentMap[firstSegId] === false) {
-                errors.push({ Rule: "R14_ANCHOR_START", Row: "FIRST_SEGMENT", Message: `Anchor PID '${anchorPid}' wajib ada di Segmen Pertama (${firstSegId}). File ini dimulai dengan project lain/kosong.` });
-            }
-        }
-
-        segmentOrder.forEach(segId => {
-            if (segmentMap[segId] === false) {
-                errors.push({ Rule: "R15_ANCHOR_SEGMENT_MISSING", Row: "SEGMENT_CHECK", Message: `Segmen ${segId} tidak memuat Anchor PID '${anchorPid}' sama sekali.` });
-            }
-        });
-
-        let anchorPidFound = false;
-        for (const r of belowData) {
-            if (r.STRNO_LENGTH === 30 && String(r.PLTXT || "").toUpperCase().trim().includes(anchorPid)) {
-                anchorPidFound = true;
-                break;
-            }
-        }
-
-        if (!anchorPidFound) {
-            errors.push({ Rule: "R13_ANCHOR_PID_MISSING", Row: "GLOBAL", Message: `Anchor PID '${anchorPid}' (dari Nama File) tidak ditemukan sama sekali pada data Core.` });
-        }
-
-        if (displayData.length) {
-            let lastPidCounts = null; 
-            let lastCableId = null;
-            const colsCheck = ["LINK_DESCRIPTION", "LINK_FRM_FLOC", "LINK_TO_FLOC", "FUNCTIONAL_LOCATION_LINK_OBJECT"];
-            
-            displayData.forEach((r, i) => {
-                colsCheck.forEach(col => {
-                    if (r[col]) { 
-                        const val = String(r[col] || "").trim();
-                        if (val && !seenStrno.has(val)) {
-                            errors.push({ Rule: "R10_CROSS_CHECK", Row: excelRow(i), Message: `Sheet 'display_ring' kol '${col}': Nilai '${val}' tidak ditemukan di 'below_ring'.` });
-                        }
-                    }
-                });
-
-                const cableId = r['LINK_DESCRIPTION'];
-                if (cableId) {
-                    const cores = belowData.filter(b => {
-                        const s = String(b.STRNO || "");
-                        const p = String(b.PLTXT || "");
-                        return s.startsWith(cableId) && s.length >= 30 && p && p.trim() !== "";
-                    });
-                    
-                    const currentPidCounts = {};
-                    cores.forEach(c => {
-                        const pid = c.PLTXT;
-                        if (!pid.toUpperCase().includes("KABEL")) {
-                            currentPidCounts[pid] = (currentPidCounts[pid] || 0) + 1;
-                        }
-                    });
-
-                    if (lastPidCounts) {
-                        for (const pid in lastPidCounts) {
-                            if (currentPidCounts.hasOwnProperty(pid)) {
-                                const countLast = lastPidCounts[pid];
-                                const countCurr = currentPidCounts[pid];
-                                if (countLast !== countCurr) {
-                                    errors.push({ Rule: "R11_PID_CONSISTENCY", Row: excelRow(i), Message: `Inkonsistensi PID ${pid} antar Segmen: ${lastCableId} (${countLast} core) -> ${cableId} (${countCurr} core).` });
-                                }
-                            }
-                        }
-                    }
-                    lastPidCounts = currentPidCounts;
-                    lastCableId = cableId;
-                }
-            });
-
-            for (let i = 1; i < displayData.length; i++) {
-                const prevTo = String(displayData[i - 1]['LINK_TO_FUNCTIONAL_LOCATION_DESC'] || "").trim();
-                const currFrom = String(displayData[i]['LINK_FROM_FUNCTIONAL_LOCATION_DESC'] || "").trim();
-                if (prevTo !== currFrom) {
-                    warnings.push({ Rule: "R20_DISPLAY_CHAIN", Row: excelRow(i), Message: `Chain Break: 'LINK_FROM_DESC' (${currFrom}) tidak menyambung dari 'LINK_TO_DESC' baris sebelumnya (${prevTo}).` });
-                }
-            }
-        }
-
-        // --- FINAL STATUS DETERMINATION ---
         let statusStr = "PASS";
-        if (errors.length > 0) statusStr = "FAIL";
-        else if (warnings.length > 0) statusStr = "WARNING";
+        if (context.errors.length > 0) statusStr = "FAIL";
+        else if (context.warnings.length > 0) statusStr = "WARNING";
 
         const exportBelowData = belowData.map(r => {
             const { STRNO_LENGTH, _rowIndex, ...rest } = r;
@@ -608,22 +389,20 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
         const headerOrder = ['STRNO', ...allKeys.filter(k => k!=='STRNO')]; 
         const sapTxt = buildSapTxtFromRows(exportBelowData, headerOrder);
 
-        // Update state saat revalidasi
         appState.processed[fileName] = {
             fileName: fileName,
             belowData: belowData,
             displayData: displayData,
             pid: anchorPid, 
             status: statusStr,
-            errors: errors,
-            warnings: warnings, 
+            errors: context.errors,
+            warnings: context.warnings, 
             sapTxt: sapTxt,
             rowId: rowId,
             isManuallyOverridden: false 
         };
         
         recalculateStats();
-
         updateDashboardUI();
         updateRowStatusUI(rowId, appState.processed[fileName]);
         updateTableRowVerifiedStatus(rowId, anchorPid);
@@ -632,9 +411,9 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
             if (statusStr === "PASS") {
                  msgCell.innerHTML = "<span class='text-green-600 dark:text-green-400 font-medium'><i class='fa-solid fa-check-circle mr-1'></i> Validated Successfully</span>";
             } else if (statusStr === "WARNING") {
-                 msgCell.innerHTML = `<span class='text-orange-600 dark:text-orange-400 font-medium'><i class='fa-solid fa-triangle-exclamation mr-1'></i> Found ${warnings.length} warnings</span>`;
+                 msgCell.innerHTML = `<span class='text-orange-600 dark:text-orange-400 font-medium'><i class='fa-solid fa-triangle-exclamation mr-1'></i> Found ${context.warnings.length} warnings</span>`;
             } else {
-                 msgCell.innerHTML = `<span class='text-red-600 dark:text-red-400 font-medium'><i class='fa-solid fa-xmark mr-1'></i> Found ${errors.length} errors</span>`;
+                 msgCell.innerHTML = `<span class='text-red-600 dark:text-red-400 font-medium'><i class='fa-solid fa-xmark mr-1'></i> Found ${context.errors.length} errors</span>`;
             }
         }
 
@@ -678,10 +457,7 @@ export async function revalidateEditedData() {
             badge.innerText = updatedItem.status;
         }
 
-        // --- PENGGUNAAN EVENT BUS (MENGGANTIKAN DYNAMIC IMPORT) ---
-        // Kita cukup memancarkan event. File ui/tables.js & ui/visualizer.js yang akan mendengarkannya.
         appEventBus.emit('DATA_REVALIDATED', updatedItem);
-
         showToast("Data berhasil divalidasi dan di-update!", "success");
 
     } catch (err) {
