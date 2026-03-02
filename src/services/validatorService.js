@@ -1,7 +1,7 @@
 /**
  * src/services/validatorService.js
  * Menangani antrean file, proses validasi, dan pengecekan Rules (R5-R20).
- * Update Phase 1.1: Fix Worker Path & Mencegah Thread Bombing (Browser Crash).
+ * Update Phase 1.2: Fix Worker Path Issue for GitHub Pages using import.meta.url
  */
 
 import { appState, recalculateStats, clearValidatorState } from '../state/store.js';
@@ -170,9 +170,7 @@ export async function startBatchValidation() {
     appState.stats.warning = 0;
     updateDashboardUI();
 
-    // FIXED: Sequential Processing.
-    // Memproses file secara berurutan agar hanya ada 1 Web Worker yang aktif pada satu waktu.
-    // Ini mencegah browser crash jika user mengunggah ratusan file sekaligus.
+    // Memproses file secara berurutan agar hanya ada 1 Web Worker yang aktif pada satu waktu
     for (const item of appState.queue) {
         await processFile(item.file, item.id);
     }
@@ -214,8 +212,11 @@ async function processFile(file, rowId) {
         }
 
         const workerResult = await new Promise((resolve, reject) => {
-            // FIXED PATH: Menggunakan ./src/excelWorker.js sesuai struktur repo yang diunggah
-            const worker = new Worker('./src/excelWorker.js');
+            // FIXED PATH FOR GITHUB PAGES: Menggunakan teknik import.meta.url
+            // Ini akan meresolve path relatif terhadap file validatorService.js
+            // Karena validatorService.js ada di `src/services/` dan worker di `src/`, kita pakai `../`
+            const workerUrl = new URL('../excelWorker.js', import.meta.url);
+            const worker = new Worker(workerUrl);
             
             worker.onmessage = function(e) {
                 resolve(e.data);
@@ -223,7 +224,8 @@ async function processFile(file, rowId) {
             };
             
             worker.onerror = function(err) {
-                reject(err);
+                console.error("Worker Execution Error:", err);
+                reject(new Error("Gagal mengeksekusi Web Worker. Kemungkinan masalah koneksi atau parsing."));
                 worker.terminate();
             };
             
@@ -283,7 +285,7 @@ async function processFile(file, rowId) {
         }
 
     } catch (err) {
-        console.error(err);
+        console.error("processFile Error:", err);
         statusCell.innerHTML = `<span class="bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-300 py-1 px-3 rounded-md text-xs font-bold uppercase">Error</span>`;
         msgCell.innerText = err.message || "Failed processing in worker";
         verifiedCell.innerHTML = "-";
