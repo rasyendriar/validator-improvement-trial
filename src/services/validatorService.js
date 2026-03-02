@@ -1,7 +1,7 @@
 /**
  * src/services/validatorService.js
  * Menangani antrean file, proses validasi, dan pengecekan Rules (R5-R20).
- * Update Phase 1.3: High-Performance Worker Pool & Concurrency Limiter.
+ * Update Phase 2: High-Performance Worker Pool & Integrasi EventBus.
  */
 
 import { appState, recalculateStats, clearValidatorState } from '../state/store.js';
@@ -9,6 +9,7 @@ import { GameSystem } from '../state/gamification.js';
 import { extractAnchorPid, isEmpty, excelRow, buildSapTxtFromRows } from '../utils/helpers.js';
 import { showToast } from '../ui/modals.js';
 import { filterQueueTable } from '../ui/tables.js';
+import { appEventBus } from '../utils/eventBus.js'; // IMPORT EVENT BUS BARU
 
 // --- UI UPDATERS (Khusus Validator) ---
 
@@ -171,12 +172,12 @@ export async function startBatchValidation() {
     appState.stats.warning = 0;
     updateDashboardUI();
 
-    // 1. Tentukan Concurrency Limit (Maksimal 6 worker untuk mencegah RAM jebol, optimal untuk performa)
+    // 1. Tentukan Concurrency Limit (Maksimal 6 worker)
     const CONCURRENCY_LIMIT = Math.min(navigator.hardwareConcurrency || 4, 6);
     const workers = [];
-    const pendingResolvers = new Map(); // Untuk mencocokkan hasil dari worker ke file yang tepat
+    const pendingResolvers = new Map(); 
 
-    // 2. Inisialisasi Worker Pool (Worker di-create SATU KALI saja, menghindari loading SheetJS berulang)
+    // 2. Inisialisasi Worker Pool 
     for (let i = 0; i < CONCURRENCY_LIMIT; i++) {
         const workerUrl = new URL('../workers/excelWorker.js', import.meta.url);
         const w = new Worker(workerUrl);
@@ -185,7 +186,6 @@ export async function startBatchValidation() {
         w.onmessage = (e) => {
             const data = e.data;
             if (data && data.fileName && pendingResolvers.has(data.fileName)) {
-                // Selesaikan Promise dari file yang bersangkutan
                 pendingResolvers.get(data.fileName)(data);
             }
         };
@@ -194,11 +194,10 @@ export async function startBatchValidation() {
         workers.push(w);
     }
 
-    // 3. Sistem Antrean (Queue System) - Membagi file ke worker yang kosong
+    // 3. Sistem Antrean (Queue System)
     let currentIndex = 0;
     const queue = [...appState.queue];
     
-    // Fungsi untuk 1 Worker memproses antrean secara beruntun sampai habis
     const processNextInPool = async (workerId) => {
         const worker = workers[workerId];
         
@@ -206,7 +205,6 @@ export async function startBatchValidation() {
             const itemIndex = currentIndex++;
             const item = queue[itemIndex];
             
-            // Tunggu 1 file selesai, lalu otomatis ambil file selanjutnya (No idle time)
             await processFileWithWorker(item.file, item.id, worker, pendingResolvers);
         }
     };
@@ -262,10 +260,8 @@ async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
 
         // Tunggu hasil dari Worker
         const workerResult = await new Promise((resolve) => {
-            // Daftarkan fungsi resolve ke Map menggunakan nama file sebagai kunci ID
             pendingResolvers.set(file.name, resolve);
             
-            // Kirim tugas ke Worker
             worker.postMessage({
                 fileBuffer: arrayBuffer,
                 fileName: file.name,
@@ -274,7 +270,6 @@ async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
             });
         });
 
-        // Tangani jika ada exception di dalam excelWorker.js
         if (!workerResult.success) {
             throw new Error(workerResult.error);
         }
@@ -333,7 +328,6 @@ async function processFileWithWorker(file, rowId, worker, pendingResolvers) {
         appState.stats.fail++;
         updateDashboardUI();
     } finally {
-        // Hapus dari map memori setelah selesai
         pendingResolvers.delete(file.name);
     }
 }
@@ -614,7 +608,7 @@ async function executeValidation(fileName, anchorPid, belowData, displayData, ro
         const headerOrder = ['STRNO', ...allKeys.filter(k => k!=='STRNO')]; 
         const sapTxt = buildSapTxtFromRows(exportBelowData, headerOrder);
 
-        // Update state saat revalidasi (tidak simpan wb lagi)
+        // Update state saat revalidasi
         appState.processed[fileName] = {
             fileName: fileName,
             belowData: belowData,
@@ -684,15 +678,9 @@ export async function revalidateEditedData() {
             badge.innerText = updatedItem.status;
         }
 
-        import('../ui/tables.js').then(m => {
-            m.renderErrorTable([...updatedItem.errors, ...(updatedItem.warnings || [])]);
-            m.renderDisplayRingTable(updatedItem.displayData);
-            m.filterTable(true);
-        });
-
-        import('../ui/visualizer.js').then(m => {
-            m.generateSVG(updatedItem.displayData, updatedItem.belowData, updatedItem.pid);
-        });
+        // --- PENGGUNAAN EVENT BUS (MENGGANTIKAN DYNAMIC IMPORT) ---
+        // Kita cukup memancarkan event. File ui/tables.js & ui/visualizer.js yang akan mendengarkannya.
+        appEventBus.emit('DATA_REVALIDATED', updatedItem);
 
         showToast("Data berhasil divalidasi dan di-update!", "success");
 
